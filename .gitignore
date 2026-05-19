@@ -21,3 +21,7 @@ wandb/
 .DS_Store
 .vscode/
 .idea/
+third_party/
+assets/*.MOV
+assets/*.mp4
+!assets/test.mp4
