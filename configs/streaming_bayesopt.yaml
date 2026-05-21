@@ -1,0 +1,101 @@
+# StreamingVision bayesopt — narrowed search space + faster phase.
+#
+# Empirical learnings from the first run (37 trials, only ~20% valid):
+#  * Sobol kept proposing tracking_outlier_prob >= 1e-10 — turns the whole
+#    dense assignment into outliers, gives 99%+ invalid fraction.
+#  * Same for sigma_F < 0.5 (too-tight feature likelihood → everything outlier)
+#    and outlier_prob < 0.5 (init Gibbs can't down-weight K-means seed mismatches).
+#  * The 10% max_outlier_pct cap killed a 0.18 IoU trial (Trial 40) at 17.6%
+#    outliers — that's a real signal we shouldn't throw away on a short video.
+#
+# Net effect: ~3x faster wall-clock (fewer wasted trials) + LCB explores the
+# region around the known-good Sobol basin (sigma_F~2, outlier_prob~5,
+# sigma_H~50-80) more efficiently.
+
+run:
+  master_seed: 42
+  output_root: assets/custom_videos/{video_id}/bayesopt
+  resume: false
+
+objective:
+  match_iou_threshold: 0.0
+  score_iou_threshold: 0.5
+  # Raised from 10 -> 20 — see comment above.  Trials with > 20 % outliers
+  # still get score 0 (visualization unusable).
+  max_outlier_pct: 20.0
+
+phase:
+  # 16 Sobol points (down from 64) — basin is already known from the first
+  # run, no need for heavy space-filling.  LCB then drives toward the optimum.
+  phase_a_sobol_evals: 16
+  fresh_model_proposal_method: candidate_pool_lcb
+  lcb_beta: 2.0
+  candidate_pool_size: 4096
+
+# Narrowed ranges: keep priors centered on the branch's known-good DAVIS
+# defaults, with enough log-scale room for the Gaussian-process LCB to learn
+# curvature.
+search_space:
+  - name: sigma_F
+    lower: 0.5
+    upper: 5.0
+    log_scale: true
+  - name: outlier_prob
+    lower: 0.5
+    upper: 10.0
+    log_scale: true
+  # tracking_outlier_prob removed from search — Ax's range validator is
+  # linear (rejects upper - lower < ~1e-4 even on log scale), and there's no
+  # interesting optimization signal here.  Pinned to 1.0e-28 from
+  # configs/streaming_default.yaml.
+  - name: outlier_velocity_gamma_shape
+    lower: 1.5
+    upper: 8.0
+  - name: outlier_velocity_gamma_rate
+    lower: 0.1
+    upper: 5.0
+    log_scale: true
+  - name: alpha
+    lower: 0.3
+    upper: 3.0
+    log_scale: true
+  - name: beta
+    lower: 0.3
+    upper: 3.0
+    log_scale: true
+  - name: sigma_H
+    lower: 10.0
+    upper: 100.0
+    log_scale: true
+  - name: sigma_V
+    lower: 1.0e13
+    upper: 1.0e15
+    log_scale: true
+  - name: translation_gaussian_scale
+    lower: 0.1
+    upper: 0.5
+  - name: translation_max_radius
+    lower: 0.2
+    upper: 0.6
+  - name: translation_num_radii_cells
+    lower: 10
+    upper: 20
+    value_type: int
+  - name: translation_theta_step_deg
+    lower: 10.0
+    upper: 30.0
+  - name: rotation_vmf_kappa
+    lower: 50.0
+    upper: 500.0
+    log_scale: true
+  - name: rotation_angle_max_deg
+    lower: 15.0
+    upper: 35.0
+  - name: rotation_angle_step_deg
+    lower: 0.2
+    upper: 1.0
+    log_scale: true
+  - name: init_gibbs_sweeps
+    lower: 10
+    upper: 25
+    value_type: int

@@ -1,0 +1,92 @@
+# Bayesian optimization for custom-video tracking (matter-weighted Jaccard).
+
+run:
+  master_seed: 42
+  output_root: assets/custom_videos/{video_id}/bayesopt
+  resume: true
+
+objective:
+  # Maximize mean per-GT-instance IoU (Hungarian match vs pseudo-GT label maps every frame).
+  match_iou_threshold: 0.0
+  score_iou_threshold: 0.5
+  # Trials with mean dense outlier % above this are invalid (Ax gets 0.0, not best-tracked).
+  max_outlier_pct: 10.0
+
+phase:
+  phase_a_sobol_evals: 64
+  fresh_model_proposal_method: candidate_pool_lcb
+  lcb_beta: 2.0
+  candidate_pool_size: 4096
+
+# All inputs to run_dino_tracking() that are not fixed by YAML config or estimated from kmeans.
+# NOT tuned: num_blobs, num_hyperblobs, datapoint_retain_pct, dense_disable_outlier_prob
+# (fixed in custom_default.yaml); random_seed, use_sam_frame0; mu_H/Psi_*/mu_F (kmeans).
+search_space:
+  # --- DinoTrackingHyperparams (GenMatter_Hyperparams_DINO priors / discrete motion grid) ---
+  - name: sigma_F
+    lower: 0.02
+    upper: 20.0
+    log_scale: true
+  - name: outlier_prob
+    lower: 0.001
+    upper: 10.0
+    log_scale: true
+    # Init Gibbs + dense assignment outlier mass (hypers.outlier_prob).
+  - name: tracking_outlier_prob
+    lower: 1.0e-30
+    upper: 10.0
+    log_scale: true
+    # Separate knob: overwrites hypers.outlier_prob during frame-to-frame tracking only.
+  - name: outlier_velocity_gamma_shape
+    lower: 1.5
+    upper: 8.0
+  - name: outlier_velocity_gamma_rate
+    lower: 0.1
+    upper: 5.0
+    log_scale: true
+  - name: alpha
+    lower: 0.1
+    upper: 10.0
+    log_scale: true
+  - name: beta
+    lower: 0.1
+    upper: 10.0
+    log_scale: true
+  - name: sigma_H
+    lower: 1.0
+    upper: 100.0
+    log_scale: true
+  - name: sigma_V
+    lower: 1.0e12
+    upper: 1.0e16
+    log_scale: true
+  - name: translation_gaussian_scale
+    lower: 0.05
+    upper: 0.5
+  - name: translation_max_radius
+    lower: 0.1
+    upper: 0.8
+  - name: translation_num_radii_cells
+    lower: 8
+    upper: 24
+    value_type: int
+  - name: translation_theta_step_deg
+    lower: 5.0
+    upper: 45.0
+  - name: rotation_vmf_kappa
+    lower: 1.0
+    upper: 500.0
+    log_scale: true
+  - name: rotation_angle_max_deg
+    lower: 5.0
+    upper: 45.0
+  - name: rotation_angle_step_deg
+    lower: 0.1
+    upper: 2.0
+    log_scale: true
+
+  # --- DinoTrackingParams (inference schedule) ---
+  - name: init_gibbs_sweeps
+    lower: 5
+    upper: 30
+    value_type: int

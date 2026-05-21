@@ -25,3 +25,10 @@ third_party/
 assets/*.MOV
 assets/*.mp4
 !assets/test.mp4
+assets/custom_videos/
+.jax_cache/
+assets/deeplearning_weights/
+assets/videos_tmp/
+# Vendored externals: ship source only; weights via get_weights.sh / HF
+genmatterpp/external/**/.git/
+genmatterpp/external/**/checkpoints/

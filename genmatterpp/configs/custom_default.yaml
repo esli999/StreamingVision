@@ -1,0 +1,105 @@
+# GenMatter custom video pipeline — default configuration.
+# Matches DAVIS TAP-Vid preprocessing + run_davis_tracking.py hyperparameters.
+
+paths:
+  custom_videos_root: null  # null → assets/custom_videos (see config.CUSTOM_VIDEOS_BASE)
+  deeplearning_weights_dir: null  # null → assets/deeplearning_weights
+  video_depth_anything_path: null  # null → external/video-depth-anything or GENMATTER_VIDEO_DEPTH_ANYTHING_PATH
+
+preprocess:
+  pipeline:
+    skip_existing: false
+    force: false
+
+  frames:
+    max_len: -1
+    target_fps: -1
+    skip_frames: 1
+    max_res: 1280
+    jpg_quality: 95
+    frame_name_pattern: "{:05d}.jpg"
+
+  motion_3d:
+    encoder: vitl
+    input_size: 518
+    max_res: 1280
+    max_len: -1
+    target_fps: -1
+    fp32: false
+    device: cuda
+    skip_frames: 1
+    subsample: 1.0
+
+  dino:
+    target_h: 520
+    target_w: 960
+    patch_size: 14
+    n_components: 10
+    device: cuda
+
+  sam_frame0:
+    model: sam2.1_l.pt
+    min_threshold: 0.15
+    seed: 42
+    frame_name: "00000.jpg"
+
+# SAM2 pseudo-GT for evaluation / Bayesopt (all frames; faster than frame-0 SAM)
+pseudo_gt:
+  model: sam2.1_l.pt  # SAM2.1 large — same tier as preprocess sam_frame0
+  min_threshold: 0.15
+  iou_threshold: 0.3
+  prefer_video: true
+  video_imgsz: 1024       # SAM2 inference size (segmasks saved at native RGB resolution)
+  max_objects: 12         # track largest frame-0 instances only (VRAM)
+  video_chunk_frames: 16  # reset video predictor every N frames to cap VRAM
+  detect_new_objects: true  # per-frame SAM for objects entering after frame 0
+
+# Used by ``genmatter track`` (stage 2 — not run during preprocess)
+tracking:
+  pipeline:
+    skip_existing: false
+    force: false
+  measure_fps: true
+  num_blobs: 500
+  num_hyperblobs: 9
+  datapoint_retain_pct: 78.125
+  random_seed: 42
+  focal_length: 520.0
+  use_sam_frame0: true
+  init_gibbs_sweeps: 15
+  tracking_outlier_prob: 1.0e-28
+  # When true, dense per-pixel labels never use the outlier bucket (fewer black points in viz).
+  dense_disable_outlier_prob: false
+  blob_counting_threshold: 0
+
+  hyperparams:
+    sigma_F: 2.0
+    # Prior mass for outlier vs blobs during init Gibbs; lower → fewer outliers if dense outliers stay on.
+    outlier_prob: 5.0
+    outlier_velocity_gamma_shape: 5.0
+    outlier_velocity_gamma_rate: 1.0
+    alpha: 1.0
+    beta: 1.0
+    sigma_H: 25.0  # (10 * 0.5)^2 empirical scale in tracking script
+    sigma_V: 1.0e14
+    translation_gaussian_scale: 0.2
+    translation_max_radius: 0.35
+    translation_num_radii_cells: 15
+    translation_theta_step_deg: 15
+    rotation_vmf_kappa: 100.0
+    rotation_angle_max_deg: 25.0
+    rotation_angle_step_deg: 0.375
+
+# Used by ``genmatter viz`` — export dense tracking to Rerun .rrd
+viz:
+  pipeline:
+    skip_existing: false
+    force: false
+  point_radius: 0.015
+  flow_arrow_scale: 1.0
+  ellipsoid_sigma_scale: 1.0
+  feature_pca_seed: 42
+  include_assignment_colors: true
+  include_hyperblob_assignment_colors: true
+  include_flow: true
+  include_depth: true

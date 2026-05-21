@@ -1,0 +1,104 @@
+# StreamingVision: tracker hyperparameters for test.mp4
+# Cloned from genmatterpp/configs/custom_default.yaml. Adjusted for the
+# streaming budget (64 blobs / 4 hyperblobs / 2925 datapoints) so the
+# hyperparameters tuned by bayesopt transfer directly to the streaming demo.
+
+paths:
+  custom_videos_root: assets/custom_videos
+  deeplearning_weights_dir: assets/deeplearning_weights
+  video_depth_anything_path: null  # set via GENMATTER_VIDEO_DEPTH_ANYTHING_PATH or external/video-depth-anything
+
+preprocess:
+  pipeline:
+    skip_existing: true
+    force: false
+
+  frames:
+    max_len: -1
+    target_fps: -1
+    skip_frames: 1
+    max_res: 1280
+    jpg_quality: 95
+    frame_name_pattern: "{:05d}.jpg"
+
+  motion_3d:
+    encoder: vits        # small VDA encoder — the vitl variant OOM'd on our 4K source even at 720p
+    input_size: 392      # smaller than the 518 default to keep attention seq-length down
+    max_res: 480         # was 720; RAFT corr-volume O((H*W)^2) memory OOM'd at 720p
+    max_len: -1
+    target_fps: -1
+    fp32: false
+    device: cuda
+    skip_frames: 1
+    subsample: 1.0
+
+  dino:
+    target_h: 520
+    target_w: 960
+    patch_size: 14
+    n_components: 10
+    device: cuda
+
+  sam_frame0:
+    model: sam2.1_l.pt
+    min_threshold: 0.15
+    seed: 42
+    frame_name: "00000.jpg"
+
+# SAM2 pseudo-GT for offline bayesopt scoring
+pseudo_gt:
+  model: sam2.1_l.pt
+  min_threshold: 0.15
+  iou_threshold: 0.3
+  prefer_video: true
+  video_imgsz: 1024
+  max_objects: 12
+  video_chunk_frames: 16
+  detect_new_objects: true
+
+# Tracker hypers — these match the streaming MatterWorker's settings
+tracking:
+  pipeline:
+    skip_existing: false
+    force: false
+  measure_fps: true
+  num_blobs: 64
+  num_hyperblobs: 4
+  datapoint_retain_pct: 81.25  # 2925 of 3600 candidates (= 3 * Gibbs batch_size 975)
+  random_seed: 42
+  focal_length: 520.0
+  use_sam_frame0: true
+  init_gibbs_sweeps: 15
+  tracking_outlier_prob: 1.0e-28
+  dense_disable_outlier_prob: false
+  blob_counting_threshold: 0
+
+  hyperparams:
+    sigma_F: 2.0
+    outlier_prob: 5.0
+    outlier_velocity_gamma_shape: 5.0
+    outlier_velocity_gamma_rate: 1.0
+    alpha: 1.0
+    beta: 1.0
+    sigma_H: 25.0
+    sigma_V: 1.0e14
+    translation_gaussian_scale: 0.2
+    translation_max_radius: 0.35
+    translation_num_radii_cells: 15
+    translation_theta_step_deg: 15
+    rotation_vmf_kappa: 100.0
+    rotation_angle_max_deg: 25.0
+    rotation_angle_step_deg: 0.375
+
+viz:
+  pipeline:
+    skip_existing: false
+    force: false
+  point_radius: 0.015
+  flow_arrow_scale: 1.0
+  ellipsoid_sigma_scale: 1.0
+  feature_pca_seed: 42
+  include_assignment_colors: true
+  include_hyperblob_assignment_colors: true
+  include_flow: true
+  include_depth: true

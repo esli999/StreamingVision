@@ -1,0 +1,98 @@
+paths:
+  custom_videos_root: assets/custom_videos
+  deeplearning_weights_dir: assets/deeplearning_weights
+  video_depth_anything_path: null
+preprocess:
+  pipeline:
+    skip_existing: true
+    force: false
+  frames:
+    max_len: -1
+    target_fps: -1
+    skip_frames: 1
+    max_res: 1280
+    jpg_quality: 95
+    frame_name_pattern: '{:05d}.jpg'
+  motion_3d:
+    encoder: vits
+    input_size: 392
+    max_res: 480
+    max_len: -1
+    target_fps: -1
+    fp32: false
+    device: cuda
+    skip_frames: 1
+    subsample: 1.0
+  dino:
+    target_h: 520
+    target_w: 960
+    patch_size: 14
+    n_components: 10
+    device: cuda
+  sam_frame0:
+    model: sam2.1_l.pt
+    min_threshold: 0.15
+    seed: 42
+    frame_name: 00000.jpg
+pseudo_gt:
+  model: sam2.1_l.pt
+  min_threshold: 0.15
+  iou_threshold: 0.3
+  prefer_video: true
+  video_imgsz: 1024
+  max_objects: 12
+  video_chunk_frames: 16
+  detect_new_objects: true
+tracking:
+  pipeline:
+    skip_existing: false
+    force: false
+  measure_fps: true
+  num_blobs: 64
+  num_hyperblobs: 4
+  datapoint_retain_pct: 81.25
+  random_seed: 42
+  focal_length: 520.0
+  use_sam_frame0: true
+  init_gibbs_sweeps: 15
+  # Streaming pipeline calibration is different from the offline bayesopt
+  # cohort: with our frame-0 DINO PCA basis + DepthAnythingV2 min/max-normalized
+  # Z, the 32-dim feature log-lik baseline at sigma_F~4 lands around -76, head-
+  # to-head with log(1e-28)~-65 for the categorical outlier prior — so
+  # ~28-95% of datapoints flip to outlier per Gibbs sweep (verified by
+  # synthetic sweep on 2026-05-20). 1e-60 underflows to 0 in float32, so the
+  # outlier class gets log-prior -inf and never wins; outliers go to 0%.
+  tracking_outlier_prob: 1.0e-60
+  dense_disable_outlier_prob: false
+  blob_counting_threshold: 0
+  hyperparams:
+    sigma_F: 4.38792196017069
+    outlier_prob: 4.525842704512471
+    outlier_velocity_gamma_shape: 4.597982224076986
+    outlier_velocity_gamma_rate: 0.11512864600818656
+    alpha: 0.3646241983230548
+    beta: 1.8264660163540756
+    sigma_H: 91.86612408596491
+    sigma_V: 123807185197582.55
+    translation_gaussian_scale: 0.28259877599775796
+    translation_max_radius: 0.5680604964494704
+    translation_num_radii_cells: 12
+    translation_theta_step_deg: 19.571981206536293
+    rotation_vmf_kappa: 124.58396655909301
+    rotation_angle_max_deg: 17.787536066025496
+    rotation_angle_step_deg: 0.9157716024849818
+viz:
+  pipeline:
+    skip_existing: false
+    force: false
+  point_radius: 0.015
+  flow_arrow_scale: 1.0
+  ellipsoid_sigma_scale: 1.0
+  feature_pca_seed: 42
+  include_assignment_colors: true
+  include_hyperblob_assignment_colors: true
+  include_flow: true
+  include_depth: true
+_meta:
+  source: bayesopt 20260521_000113 trial 26
+  objective_avg_mean_gt_iou: null

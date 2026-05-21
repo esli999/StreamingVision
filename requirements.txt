@@ -2,9 +2,9 @@
 torch>=2.7.0
 torchvision>=0.22.0
 transformers>=4.45
-opencv-python>=4.11.0.86
+opencv-python==4.11.0.86
 pillow
-numpy
+numpy<2
 jupyterlab
 ipykernel>=6
 nbformat>=5
@@ -12,6 +12,24 @@ nbconvert>=7
 ipywidgets>=8
 einops
 huggingface_hub
-jax[cuda12]>=0.4.30
+jax[cuda12]==0.5.3
 k3d>=2.16
 matplotlib
+# GenMatter++ JAX inference (vendored under genmatterpp/ — see VENDORED.md)
+genjax==0.10.3
+tensorflow-probability==0.23.0
+scikit-learn
+scikit-image==0.25.2
+# Bayesian hyperparameter optimization
+ax-platform>=0.4.0
+botorch>=0.12.0
+# SAM2 pseudo-GT for offline bayesopt
+ultralytics>=8.4.26
+# Vendored CLI machinery
+pyyaml>=6.0
+imageio[ffmpeg]==2.37.0
+tqdm==4.67.1
+rich==13.9.4
+easydict
+timm==1.0.19
+rerun-sdk==0.23.1

@@ -22,8 +22,8 @@ this stream's latest output is. Computed at recorder snapshot time as
 `latest_rgb_gid − this_slot_gid`. `depth stale 1f` means the depth slot's
 most recent value was derived from an RGB frame that is 1 frame older than
 the current RGB frame. RGB is always `0f` because it IS the latest source
-frame; fusion is usually `1–2f` because it depends on depth/flow/features
-which themselves are ≥1f stale.
+frame; matter is typically `1–3f` because each Gibbs sweep depends on the
+current depth/flow/features slots, which themselves are ≥1f stale.
 
 Together they tell you two different things:
 - **lat**: how heavy each model is on the GPU.
@@ -60,11 +60,32 @@ Causal-honesty contract
 import os
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.25"
+# Pin BLAS/OpenMP/MKL thread pools to ONE thread BEFORE importing numpy /
+# sklearn / torch.  The streaming pipeline runs 5 Python threads concurrently
+# (FrameSource, DepthWorker, FlowWorker, FeatureWorker, MatterWorker); when
+# MatterWorker calls sklearn KMeans (during init_state) while the other
+# workers are mid-flight with torch CUDA + JAX work, OpenMP nesting can
+# deadlock the KMeans thread pool acquisition.  Symptom: process sits at
+# 0-1% CPU forever after the "entering K-means hierarchical init" log line.
+# Single-threaded BLAS is a tiny perf hit (heavy work is on the GPU) and
+# eliminates the deadlock entirely.
+for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
+           "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+           "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_v, "1")
 
 import sys, json, argparse, time, threading, subprocess, shutil
+import faulthandler, signal
 from collections import deque
 from dataclasses import dataclass, field, replace
 from typing import Any, Optional, Dict, List, Tuple
+
+# Dump tracebacks for every Python thread when we receive SIGUSR1.  This is
+# how we debug hangs in MatterWorker init: `kill -USR1 <pid>` writes
+# tracebacks to stderr (and our log file) so we can see exactly which line
+# is blocked without needing sudo for py-spy / gdb.
+faulthandler.enable()
+faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
 
 sys.path.insert(0, os.path.abspath("third_party/SEA-RAFT/core"))
 
@@ -75,11 +96,12 @@ import torch.nn.functional as F
 
 import jax
 import jax.numpy as jnp
-from jax.scipy.signal import convolve2d
 
 from transformers import AutoImageProcessor, AutoModelForDepthEstimation, AutoModel
 from torchvision.utils import flow_to_image
 from raft import RAFT
+
+import genmatter_rt
 
 
 # ---------- Primitives ----------
@@ -165,77 +187,12 @@ dino_model = AutoModel.from_pretrained(dino_ckpt, torch_dtype=torch.float16).to(
 print("models loaded.")
 
 
-# ---------- JAX fusion kernels ----------
-
-SOBEL_X = jnp.array([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]], dtype=jnp.float32)
-SOBEL_Y = SOBEL_X.T
-
-def _gauss1d(sigma, radius):
-    x = jnp.arange(-radius, radius + 1, dtype=jnp.float32)
-    k = jnp.exp(-(x ** 2) / (2 * sigma ** 2))
-    return k / k.sum()
-
-def _blur2d(img, sigma=3.0, radius=9):
-    k = _gauss1d(sigma, radius)
-    img = convolve2d(img, k[None, :], mode="same")
-    img = convolve2d(img, k[:, None], mode="same")
-    return img
-
-@jax.jit
-def fx_neon_glow(depth, flow_mag, frame_bgr):
-    dx = convolve2d(depth, SOBEL_X, mode="same")
-    dy = convolve2d(depth, SOBEL_Y, mode="same")
-    edges = jnp.sqrt(dx**2 + dy**2)
-    edges = edges / (edges.max() + 1e-6)
-    motion = edges * (flow_mag / (flow_mag.max() + 1e-6))
-    glow = jnp.clip(_blur2d(motion, sigma=2.5, radius=7) * 6.0, 0., 1.)[..., None]
-    neon = jnp.array([220., 50., 255.], dtype=jnp.float32)
-    return jnp.clip(frame_bgr.astype(jnp.float32) + glow * neon, 0., 255.).astype(jnp.uint8)
-
-@jax.jit
-def fx_salience(depth, flow_mag, frame_bgr):
-    d_norm = (depth - depth.min()) / (depth.max() - depth.min() + 1e-6)
-    f_norm = flow_mag / (flow_mag.max() + 1e-6)
-    s = jnp.clip(_blur2d((1. - d_norm) * f_norm, sigma=3.0, radius=9) * 4.0, 0., 1.)
-    r = jnp.clip(3.*s,       0., 1.)
-    g = jnp.clip(3.*s - 1.,  0., 1.)
-    b = jnp.clip(3.*s - 2.,  0., 1.)
-    hot_bgr = jnp.stack([b, g, r], axis=-1) * 255.
-    alpha = s[..., None] * 0.7
-    return jnp.clip(frame_bgr.astype(jnp.float32) * (1 - alpha)
-                    + hot_bgr * alpha, 0., 255.).astype(jnp.uint8)
-
-@jax.jit
-def fx_topo(depth, flow_x, flow_y, frame_bgr):
-    n_bands = 12
-    d_norm = (depth - depth.min()) / (depth.max() - depth.min() + 1e-6)
-    bands = jnp.floor(d_norm * n_bands)
-    dv = jnp.abs(jnp.diff(bands, axis=0, prepend=bands[:1, :]))
-    dh = jnp.abs(jnp.diff(bands, axis=1, prepend=bands[:, :1]))
-    edge = ((dv + dh) > 0).astype(jnp.float32)
-    edge = jnp.clip(_blur2d(edge, sigma=1.0, radius=3) * 2.0, 0., 1.)
-    hue = (jnp.arctan2(flow_y, flow_x) + jnp.pi) / (2. * jnp.pi)
-    h6 = hue * 6.0
-    x = 1. - jnp.abs((h6 % 2.) - 1.)
-    sec = jnp.floor(h6).astype(jnp.int32) % 6
-    r = jnp.choose(sec, [jnp.ones_like(x), x, jnp.zeros_like(x),
-                         jnp.zeros_like(x), x, jnp.ones_like(x)], mode="clip")
-    g = jnp.choose(sec, [x, jnp.ones_like(x), jnp.ones_like(x),
-                         x, jnp.zeros_like(x), jnp.zeros_like(x)], mode="clip")
-    b = jnp.choose(sec, [jnp.zeros_like(x), jnp.zeros_like(x), x,
-                         jnp.ones_like(x), jnp.ones_like(x), x], mode="clip")
-    rgb_bgr = jnp.stack([b, g, r], axis=-1) * 255.
-    return jnp.clip(frame_bgr.astype(jnp.float32) + rgb_bgr * edge[..., None],
-                    0., 255.).astype(jnp.uint8)
-
-# --- DINO feature kernels ---
+# ---------- DINO feature kernels ----------
 
 # Number of patches DINOv2-S/14 produces at the 224x224 input the HF processor
 # resizes to: gh = gw = 16, so 256 patches. Fixed for jit shape stability.
 N_DINO_PATCHES = 256
 DINO_DIM       = 384
-KMEANS_K       = 8
-KMEANS_ITERS   = 5
 
 @jax.jit
 def fx_dino_pca(feats):
@@ -258,41 +215,9 @@ def fx_dino_pca(feats):
     return proj, pcs
 
 
-@jax.jit
-def fx_kmeans_clusters(feats, centers):
-    """K-means on dense DINO features. Warm-started from previous frame's centers
-    so feature-cluster identity is stable enough to permute on the host.
-
-    feats:   (N_DINO_PATCHES, DINO_DIM) float32
-    centers: (KMEANS_K, DINO_DIM) float32
-    Returns (labels, new_centers).
-    """
-    def body(_, c):
-        d2 = ((feats[:, None, :] - c[None, :, :]) ** 2).sum(-1)
-        labels = jnp.argmin(d2, axis=1)
-        oh = jax.nn.one_hot(labels, c.shape[0])
-        counts = oh.sum(0)
-        new = (oh.T @ feats) / jnp.maximum(counts, 1.0)[:, None]
-        # If a cluster is empty (count == 0), keep its previous center.
-        return jnp.where(counts[:, None] > 0, new, c)
-
-    centers = jax.lax.fori_loop(0, KMEANS_ITERS, body, centers)
-    d2 = ((feats[:, None, :] - centers[None, :, :]) ** 2).sum(-1)
-    labels = jnp.argmin(d2, axis=1)
-    return labels, centers
-
-
-# Warmup at the working resolution.
-_z2 = jnp.zeros((RESIZE[1], RESIZE[0]), dtype=jnp.float32)
-_z3 = jnp.zeros((RESIZE[1], RESIZE[0], 3), dtype=jnp.uint8)
-fx_neon_glow(_z2, _z2, _z3).block_until_ready()
-fx_salience(_z2, _z2, _z3).block_until_ready()
-fx_topo(_z2, _z2, _z2, _z3).block_until_ready()
-
-_zfeat   = jnp.zeros((N_DINO_PATCHES, DINO_DIM), dtype=jnp.float32)
-_zcenters = jnp.zeros((KMEANS_K, DINO_DIM), dtype=jnp.float32)
+# Warmup the PCA kernel at the patch grid the FeatureWorker actually feeds it.
+_zfeat = jnp.zeros((N_DINO_PATCHES, DINO_DIM), dtype=jnp.float32)
 _p, _q = fx_dino_pca(_zfeat); _p.block_until_ready(); _q.block_until_ready()
-_l, _c = fx_kmeans_clusters(_zfeat, _zcenters); _l.block_until_ready(); _c.block_until_ready()
 
 
 # ---------- Workers ----------
@@ -512,144 +437,196 @@ class FeatureWorker(threading.Thread):
             self._last_id = snap.source_global_id
 
 
-# Tab10-style 8-color BGR palette for k-means clusters. Chosen for high
-# inter-cluster contrast and reasonable luminance.
-_KMEANS_PALETTE = np.array([
-    [180,  50,  31],   # blue
-    [ 14, 127, 255],   # orange
-    [ 44, 160,  44],   # green
-    [ 40,  39, 214],   # red
-    [189, 103, 148],   # purple
-    [ 75,  86, 140],   # brown
-    [194, 119, 227],   # pink
-    [127, 127, 127],   # gray
-], dtype=np.uint8)
+# ---------- GenMatter++ Gibbs tracker ----------
 
+class MatterWorker(threading.Thread):
+    """Per-frame GenMatter++ DINO Gibbs sweep.
 
-def _permute_kmeans_labels(new_centers, prev_centers):
-    """Greedy match new clusters → prev clusters by cosine similarity.
+    Consumes depth + flow + features, unprojects to 3D points + 3D velocities
+    at a 1/8 subsampled grid (2925 datapoints), and runs one Gibbs sweep
+    using the persistent GenMatter_State_DINO from the previous frame.
 
-    Returns perm: array of length K where perm[i] = the previous-cluster
-    slot that new cluster i should be reassigned to. Used to remap labels
-    and reorder centers so cluster colors track regions across frames.
+    Publishes all ROW2 + ROW3 tiles in one payload per Gibbs sweep:
+      * clusters             — hyperblob (~4) Gaussian ellipses on RGB
+      * particles            — blob (~64) Gaussian ellipses on RGB
+      * pixel_by_cluster     — per-pixel mask colored by hyperblob assignment
+      * pixel_by_particle    — per-pixel mask colored by blob assignment
+      * pointcloud_by_cluster   — 3D-view point cloud, colored by hyperblob
+      * pointcloud_by_particle  — 3D-view point cloud, colored by blob
+
+    The two pointcloud tiles are CPU splats from the same per-pixel mask
+    images above, so they're guaranteed visually consistent with the 2D
+    pixel-mask tiles (same coloring, same frame of data) but show the depth
+    structure that the 2D views collapse away.
+
+    First valid frame triggers K-means init + warmup Gibbs sweeps + JIT
+    compile — expect 30-90 s of blocking on cold start before any output
+    appears.  Subsequent calls hit the JIT cache (~10 ms per sweep on RTX
+    5090).
     """
-    K = new_centers.shape[0]
-    a = new_centers / (np.linalg.norm(new_centers, axis=1, keepdims=True) + 1e-9)
-    b = prev_centers / (np.linalg.norm(prev_centers, axis=1, keepdims=True) + 1e-9)
-    S = a @ b.T   # (K, K)
-    perm = np.full(K, -1, dtype=np.int32)
-    used_prev = set()
-    used_new  = set()
-    Sm = S.copy()
-    for _ in range(K):
-        idx = int(np.argmax(Sm))
-        i, j = idx // K, idx % K
-        perm[i] = j
-        used_new.add(i); used_prev.add(j)
-        Sm[i, :] = -np.inf
-        Sm[:, j] = -np.inf
-    return perm
 
-
-class FusionWorker(threading.Thread):
-    def __init__(self, depth, flow, rgb, features, out, poll=0.001):
-        super().__init__(daemon=True, name="FusionWorker")
-        self.depth, self.flow, self.rgb, self.features = depth, flow, rgb, features
+    def __init__(self, depth, flow, features, rgb, out, poll=0.001,
+                  intrinsics=None, config_path=None):
+        super().__init__(daemon=True, name="MatterWorker")
+        self.depth, self.flow, self.features, self.rgb = depth, flow, features, rgb
         self.out, self.poll = out, poll
+        self.intrinsics = intrinsics or genmatter_rt.DEFAULT_INTRINSICS
+        self.yaml_cfg = genmatter_rt.load_yaml_hypers(config_path)
+        self._num_blobs = int(self.yaml_cfg["tracking"]["num_blobs"])
+        self._num_hyperblobs = int(self.yaml_cfg["tracking"]["num_hyperblobs"])
         self._last_d_v = self._last_f_v = self._last_ft_v = -1
-        # K-means warm-start state. None on first frame → init from feats.
-        self._km_centers: Optional[jnp.ndarray] = None
+        self._state = None
+        self._indices = None
+        self._pca_basis = None
+        self._pca_mean = None
+        self._pca_std = None
+        self._key = jax.random.PRNGKey(0)
+        # Diagnostic: per-frame outlier_frac from the Gibbs assignment so we
+        # can distinguish "tons of outliers in the viz" (NN-fill artifact) from
+        # "tons of real Gibbs outliers" (hyperparam / wraparound issue).
+        self._outlier_history: List[float] = []
+        self._last_loop_idx = 0
+        # Pointcloud focal length is auto-fit on the first matter frame and
+        # then FROZEN — recomputing it per frame makes the cloud jitter
+        # in/out even when depth is stable, because the percentile XY extents
+        # fluctuate with depth-normalization noise.
+        self._pointcloud_focal: Optional[float] = None
 
     def run(self):
         while not STOP.is_set():
             ds   = self.depth.snapshot()
             fs   = self.flow.snapshot()
-            rs   = self.rgb.snapshot()
             ftsn = self.features.snapshot()
-            # We need depth + rgb + features to produce a useful tile.
-            # Flow is allowed to be invalid (we'll zero it).
-            if not (ds.valid and rs.valid and ftsn.valid):
+            rs   = self.rgb.snapshot()
+            if not (ds.valid and fs.valid and ftsn.valid and rs.valid):
                 time.sleep(self.poll); continue
             if (ds.version == self._last_d_v and fs.version == self._last_f_v
                     and ftsn.version == self._last_ft_v):
                 time.sleep(self.poll); continue
+
             t0 = time.monotonic()
-            depth_j = ds.payload["jax"]
-            frame_j = jnp.asarray(rs.payload["bgr"])
-            if fs.valid:
-                flow_raw = fs.payload["raw"]
-                fx_j = jnp.asarray(flow_raw[0].astype(np.float32))
-                fy_j = jnp.asarray(flow_raw[1].astype(np.float32))
-                fm_j = jnp.sqrt(fx_j**2 + fy_j**2)
-            else:
-                H, W = depth_j.shape
-                fx_j = jnp.zeros((H, W), dtype=jnp.float32)
-                fy_j = jnp.zeros((H, W), dtype=jnp.float32)
-                fm_j = jnp.zeros((H, W), dtype=jnp.float32)
+            try:
+                # CPU prep: unproject + feature gather (these are NumPy /
+                # cv2 ops and cheap).
+                depth_np = ds.payload["raw"].astype(np.float32)
+                flow_np  = fs.payload["raw"]
+                feat_np  = ftsn.payload["raw"]
 
-            feat_jax = ftsn.payload["jax"]
-            gh, gw   = ftsn.payload["grid_hw"]
-            # Initialize k-means centers on the very first frame from this
-            # frame's features (evenly-spaced rows for diversity). On
-            # subsequent frames, warm-start from the previous run's centers.
-            if self._km_centers is None:
-                idx = jnp.linspace(0, N_DINO_PATCHES - 1, KMEANS_K).astype(jnp.int32)
-                init_centers = feat_jax[idx]
-            else:
-                init_centers = self._km_centers
+                if self._indices is None:
+                    h, w = depth_np.shape
+                    self._indices = genmatter_rt.subsample_indices(
+                        h=h, w=w, stride=genmatter_rt.STRIDE,
+                        n_keep=genmatter_rt.N_KEEP, seed=0)
+                positions, velocities = genmatter_rt.unproject(
+                    depth_np, flow_np, self._indices, self.intrinsics,
+                    genmatter_rt.STRIDE)
+                features, self._pca_basis, self._pca_mean, self._pca_std = \
+                    genmatter_rt.dino_features_to_datapoints(
+                        feat_np, self._indices, self._pca_basis, self._pca_mean,
+                        self._pca_std,
+                        stride=genmatter_rt.STRIDE,
+                        image_hw=depth_np.shape,
+                        target_dim=genmatter_rt.FEATURE_DIM)
 
-            with GPU:
-                neon = fx_neon_glow(depth_j, fm_j, frame_j).block_until_ready()
-                sal  = fx_salience(depth_j, fm_j, frame_j).block_until_ready()
-                topo = fx_topo(depth_j, fx_j, fy_j, frame_j).block_until_ready()
-                labels_j, new_centers_j = fx_kmeans_clusters(feat_jax, init_centers)
-                labels_j.block_until_ready()
-                new_centers_j.block_until_ready()
+                with GPU:
+                    if self._state is None:
+                        print(f"[MatterWorker] init: K-means + warmup Gibbs + "
+                              f"JIT compile (this takes ~30-90s on cold start)...",
+                              flush=True)
+                        self._state, self._key = genmatter_rt.init_state(
+                            positions, velocities, features, self._key,
+                            yaml_cfg=self.yaml_cfg,
+                            num_blobs=self._num_blobs,
+                            num_hyperblobs=self._num_hyperblobs,
+                            verbose=True)
+                        # Pay the per-step JIT cost up front so steady-state
+                        # latency below is honest.
+                        self._state, self._key = genmatter_rt.step(
+                            self._state, positions, velocities, features, self._key)
+                        print(f"[MatterWorker] init complete.")
+                    else:
+                        self._state, self._key = genmatter_rt.step(
+                            self._state, positions, velocities, features, self._key)
+                    self._state.datapoints_state.blob_assignments.block_until_ready()
 
-            new_centers_np = np.array(new_centers_j)
-            labels_np      = np.array(labels_j).astype(np.int32)
+                blob_a, hyperblob_a = genmatter_rt.extract_assignments(self._state)
 
-            # Greedy permutation against previous centers so cluster colors
-            # stay attached to the same semantic region across frames. On
-            # the first frame, perm is identity (initial state).
-            if self._km_centers is not None:
-                prev_np = np.array(self._km_centers)
-                perm    = _permute_kmeans_labels(new_centers_np, prev_np)
-                # remap labels: each label i maps to perm[i]
-                labels_np = perm[labels_np]
-                # reorder centers so slot j holds the cluster that now represents
-                # what slot j represented before (used as warm-start next frame).
-                reordered = np.zeros_like(new_centers_np)
-                reordered[perm] = new_centers_np
-                new_centers_np = reordered
+                # Diagnostic probe: outlier fraction this frame + loop-wrap marker.
+                frac = float(np.mean(blob_a == -1))
+                self._outlier_history.append(frac)
+                loop_idx = int(rs.extras.get("loop_idx", 0)) if rs.extras else 0
+                wrap = "  <WRAP>" if loop_idx != self._last_loop_idx else ""
+                self._last_loop_idx = loop_idx
+                print(f"[MatterWorker] gid={rs.source_global_id:4d} "
+                      f"src_idx={rs.source_frame_idx:3d} loop={loop_idx} "
+                      f"outlier_frac={frac:.4f}{wrap}", flush=True)
 
-            self._km_centers = jnp.asarray(new_centers_np)
+                pixel_by_particle_bgr, pixel_by_cluster_bgr = genmatter_rt.render_matter_tile(
+                    blob_a, hyperblob_a, self._indices,
+                    h=depth_np.shape[0], w=depth_np.shape[1],
+                    stride=genmatter_rt.STRIDE)
+                # 3D-ellipse overlays atop the live RGB frame.  Hyperblob ellipses
+                # tend to be large (whole-scene) — render them at a lower sigma_scale
+                # than blobs.
+                base_bgr = rs.payload["bgr"]
+                blob_means, blob_covs = genmatter_rt.extract_blob_means_and_covs(self._state)
+                hb_means, hb_covs = genmatter_rt.extract_hyperblob_means_and_covs(self._state)
+                particles_bgr = genmatter_rt.render_centroid_tile(
+                    blob_means, blob_covs,
+                    genmatter_rt.BLOB_PALETTE[:blob_means.shape[0]],
+                    base_bgr, self.intrinsics, sigma_scale=1.0, alpha=0.55)
+                clusters_bgr = genmatter_rt.render_centroid_tile(
+                    hb_means, hb_covs,
+                    genmatter_rt.HYPERBLOB_PALETTE[:hb_means.shape[0]],
+                    base_bgr, self.intrinsics, sigma_scale=0.5, alpha=0.55)
 
-            # Build cluster colormap: (gh, gw) → upsample NEAREST → palette index.
-            labels_grid = labels_np.reshape(gh, gw)
-            labels_full = cv2.resize(labels_grid.astype(np.uint8),
-                                     (frame_j.shape[1], frame_j.shape[0]),
-                                     interpolation=cv2.INTER_NEAREST)
-            kmeans_bgr = _KMEANS_PALETTE[labels_full]   # (H, W, 3) uint8
+                # ROW3: 3D point-cloud splats colored by the same masks above.
+                # Same depth + intrinsics → spatially consistent with the 2D
+                # pixel mask tiles; the rotation just makes depth visible.
+                # The two tiles share unproject/rotate/project/sort — only the
+                # per-pixel colors differ — so amortize through the pair API.
+                # Focal length is auto-fit on the first frame, then frozen
+                # via self._pointcloud_focal so the framing stays stable.
+                pointcloud_by_cluster_bgr, pointcloud_by_particle_bgr, f_used = \
+                    genmatter_rt.render_pointcloud_tiles_pair(
+                        depth_np, pixel_by_cluster_bgr, pixel_by_particle_bgr,
+                        self.intrinsics,
+                        focal_length=self._pointcloud_focal)
+                if self._pointcloud_focal is None and f_used > 0.0:
+                    self._pointcloud_focal = f_used
 
-            payload = {
-                "neon":     np.array(neon),
-                "salience": np.array(sal),
-                "topo":     np.array(topo),
-                "kmeans":   kmeans_bgr,
-            }
-            t1 = time.monotonic()
-            self.out.publish(
-                payload=payload,
-                source_global_id=rs.source_global_id,
-                wall_start=t0, wall_complete=t1, latency=t1-t0,
-                extras={
-                    "depth_global_id":    ds.source_global_id,
-                    "flow_global_id":     fs.source_global_id if fs.valid else -1,
-                    "features_global_id": ftsn.source_global_id,
-                },
-                error=None,
-            )
+                t1 = time.monotonic()
+                self.out.publish(
+                    payload={
+                        "clusters":              clusters_bgr,
+                        "particles":             particles_bgr,
+                        "pixel_by_cluster":      pixel_by_cluster_bgr,
+                        "pixel_by_particle":     pixel_by_particle_bgr,
+                        "pointcloud_by_cluster": pointcloud_by_cluster_bgr,
+                        "pointcloud_by_particle":pointcloud_by_particle_bgr,
+                        "blob_assignments":      blob_a,
+                        "hyperblob_assignments": hyperblob_a,
+                    },
+                    source_global_id=rs.source_global_id,
+                    source_frame_idx=rs.source_frame_idx,
+                    source_time_sec=rs.source_time_sec,
+                    wall_start=t0, wall_complete=t1, latency=t1-t0,
+                    extras={"depth_global_id":    ds.source_global_id,
+                            "flow_global_id":     fs.source_global_id,
+                            "features_global_id": ftsn.source_global_id},
+                    error=None,
+                )
+            except Exception as e:
+                t1 = time.monotonic()
+                # Publish an error so the recorder still has *something* and
+                # the sidebar shows the failure rather than going silent.
+                self.out.publish(
+                    payload=None,
+                    source_global_id=rs.source_global_id,
+                    wall_start=t0, wall_complete=t1, latency=t1-t0,
+                    error=repr(e),
+                )
+                import traceback; traceback.print_exc()
             self._last_d_v  = ds.version
             self._last_f_v  = fs.version
             self._last_ft_v = ftsn.version
@@ -715,14 +692,18 @@ def _fmt_clock(seconds: float) -> str:
 def _perf_sidebar(slots, trackers, t_rec_start, source_thread, total_fps,
                   gpu_name: str, args_state: dict,
                   dropped_ticks: int = 0, max_lag_ms: float = 0.0,
-                  src_idx_at_rec_start: int = 0):
-    """Right-side 400x720 performance panel.
+                  src_idx_at_rec_start: int = 0,
+                  height: int = 1080):
+    """Right-side 400×{height} performance panel.
 
     Replaces the in-grid stats tile. Shows TOTAL FPS, recorder wall-clock,
     source-pace drift (% behind target FPS), per-stream FPS/latency/
     staleness with a color dot, and the recorder lag accounting.
+
+    ``height`` matches the grid height so this can be hstacked into the
+    final composite without padding.
     """
-    W, H = 400, 720
+    W, H = 400, height
     img = np.zeros((H, W, 3), dtype=np.uint8)
     rs = slots["rgb"].snapshot()
     now = time.monotonic()
@@ -771,7 +752,7 @@ def _perf_sidebar(slots, trackers, t_rec_start, source_thread, total_fps,
     y += 24
 
     rows = [("rgb", "rgb"), ("depth", "depth"), ("flow", "flow"),
-            ("features", "features"), ("fusion", "fusion")]
+            ("features", "features"), ("matter", "matter")]
     for label, slot_name in rows:
         s = slots[slot_name].snapshot()
         stale_f = rs.source_global_id - s.source_global_id if s.valid else -1
@@ -821,9 +802,10 @@ def _perf_sidebar(slots, trackers, t_rec_start, source_thread, total_fps,
 class Recorder(threading.Thread):
     """Capture tiles at the recorder FPS and write them to an MP4.
 
-    Geometry (output width × height = 2320 × 720):
-      - 4×2 grid of 480×360 tiles on the left (1920×720).
-      - 400×720 performance sidebar on the right.
+    Geometry (output width × height = 2320 × 1080):
+      - 4×2 grid of 480×360 tiles on the upper-left (1920×720).
+      - 1×2 grid of 960×360 point-cloud tiles below the grid (1920×360).
+      - 400×1080 performance sidebar on the right.
 
     Pacing is deadline-skip: under load the recorder pads with the last
     captured tile + a "RECORDER LAG +Nms" overlay rather than spin-writing
@@ -831,22 +813,28 @@ class Recorder(threading.Thread):
     """
 
     TILE_W, TILE_H = 480, 360
+    WIDE_TILE_W    = 960          # ROW3 tiles span 2 cells each
     SIDEBAR_W      = 400
-    # Tile grid layout: row 1 keeps inputs/per-frame model outputs; row 2 is
-    # JAX-accelerated overlays. Last cell of row 2 is the new k-means tile.
-    ROW1 = ["rgb",  "depth",    "flow", "dense_features"]
-    ROW2 = ["neon", "salience", "topo", "kmeans"]
+    # ROW1: streaming inputs / per-frame model outputs.
+    # ROW2: GenMatter++ Gibbs 2D outputs (ellipse overlays + per-pixel masks).
+    # ROW3: same per-pixel-mask data but unprojected via depth into a 3/4 view
+    #        3D point cloud — depth structure visible, identical coloring.
+    ROW1 = ["rgb",      "depth",    "flow",            "dense_features"]
+    ROW2 = ["clusters", "particles", "pixel_by_cluster", "pixel_by_particle"]
+    ROW3 = ["pointcloud_by_cluster", "pointcloud_by_particle"]
     # Map each tile name to the slot whose version drives its FPS counter
-    # and gid badge.
+    # and gid badge.  All ROW2 + ROW3 tiles come from MatterWorker.
     TILE_STREAM = {
-        "rgb":            "rgb",
-        "depth":          "depth",
-        "flow":           "flow",
-        "dense_features": "features",
-        "neon":           "fusion",
-        "salience":       "fusion",
-        "topo":           "fusion",
-        "kmeans":         "fusion",
+        "rgb":               "rgb",
+        "depth":             "depth",
+        "flow":              "flow",
+        "dense_features":    "features",
+        "clusters":          "matter",
+        "particles":         "matter",
+        "pixel_by_cluster":  "matter",
+        "pixel_by_particle": "matter",
+        "pointcloud_by_cluster":  "matter",
+        "pointcloud_by_particle": "matter",
     }
 
     def __init__(self, slots, out_path, fps=30, duration_s=10.0,
@@ -858,12 +846,14 @@ class Recorder(threading.Thread):
         self.gpu_name             = gpu_name
         self.args_state           = args_state or {}
         self.W = self.TILE_W * 4 + self.SIDEBAR_W
-        self.H = self.TILE_H * 2
+        # 3 rows of TILE_H each: ROW1 + ROW2 (4 tiles wide), then ROW3 below
+        # (2 tiles, each spanning 2 cells = 960 wide).
+        self.H = self.TILE_H * 3
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         self.writer = cv2.VideoWriter(out_path, fourcc, fps, (self.W, self.H))
         if not self.writer.isOpened():
             raise RuntimeError(f"Could not open VideoWriter for {out_path}")
-        self.trackers = {k: FpsTracker() for k in ["rgb","depth","flow","features","fusion"]}
+        self.trackers = {k: FpsTracker() for k in ["rgb","depth","flow","features","matter"]}
         self.frames_written = 0
         self.dropped_ticks  = 0
         self.max_lag_ms     = 0.0
@@ -889,7 +879,8 @@ class Recorder(threading.Thread):
 
         # Snapshot all slots at one wall-clock instant — this is the causal
         # cut. Anything written afterwards belongs to a future frame.
-        snaps = {k: self.slots[k].snapshot() for k in ["rgb","depth","flow","features","fusion"]}
+        snaps = {k: self.slots[k].snapshot()
+                  for k in ["rgb","depth","flow","features","matter"]}
 
         # Update FPS trackers from the snapshot versions (one observation per
         # recorder tick — honest from the recorder's frame of reference).
@@ -898,29 +889,40 @@ class Recorder(threading.Thread):
 
         blank = np.zeros((self.TILE_H, self.TILE_W, 3), dtype=np.uint8)
 
-        ds, flsn, ftsn, fus = snaps["depth"], snaps["flow"], snaps["features"], snaps["fusion"]
+        ds, flsn, ftsn, mat = snaps["depth"], snaps["flow"], snaps["features"], snaps["matter"]
 
         # Resolve each tile's image AND the source_global_id it derives from.
-        # `cells_imgs[name] = (img, gid)`.
+        # `cells_imgs[name] = (img, gid)`.  All ROW2 tiles come from MatterWorker.
         def _payload_or_blank(snap, key):
             return snap.payload[key] if snap.valid and snap.payload and key in snap.payload else blank
 
+        wide_blank = np.zeros((self.TILE_H, self.WIDE_TILE_W, 3), dtype=np.uint8)
         cells_imgs = {
-            "rgb":            (rs.payload["bgr"],                            rs.source_global_id),
-            "depth":          (_payload_or_blank(ds,   "viz_bgr"),           ds.source_global_id),
-            "flow":           (_payload_or_blank(flsn, "viz_bgr"),           flsn.source_global_id),
-            "dense_features": (_payload_or_blank(ftsn, "dense_viz_bgr"),     ftsn.source_global_id),
-            "neon":           (_payload_or_blank(fus,  "neon"),              fus.source_global_id),
-            "salience":       (_payload_or_blank(fus,  "salience"),          fus.source_global_id),
-            "topo":           (_payload_or_blank(fus,  "topo"),              fus.source_global_id),
-            "kmeans":         (_payload_or_blank(fus,  "kmeans"),            fus.source_global_id),
+            "rgb":               (rs.payload["bgr"],                              rs.source_global_id),
+            "depth":             (_payload_or_blank(ds,   "viz_bgr"),             ds.source_global_id),
+            "flow":              (_payload_or_blank(flsn, "viz_bgr"),             flsn.source_global_id),
+            "dense_features":    (_payload_or_blank(ftsn, "dense_viz_bgr"),       ftsn.source_global_id),
+            "clusters":          (_payload_or_blank(mat,  "clusters"),            mat.source_global_id),
+            "particles":         (_payload_or_blank(mat,  "particles"),           mat.source_global_id),
+            "pixel_by_cluster":  (_payload_or_blank(mat,  "pixel_by_cluster"),    mat.source_global_id),
+            "pixel_by_particle": (_payload_or_blank(mat,  "pixel_by_particle"),   mat.source_global_id),
         }
 
-        # Resize each tile to the grid cell size, ensure writable, draw label.
-        for name in self.ROW1 + self.ROW2:
+        # ROW3 tiles are wide (960×360) and may not be ready if matter slot is
+        # empty. Use a wide blank in that case.
+        def _wide_payload_or_blank(snap, key):
+            if snap.valid and snap.payload and key in snap.payload:
+                return snap.payload[key]
+            return wide_blank
+        cells_imgs["pointcloud_by_cluster"]  = (_wide_payload_or_blank(mat, "pointcloud_by_cluster"),  mat.source_global_id)
+        cells_imgs["pointcloud_by_particle"] = (_wide_payload_or_blank(mat, "pointcloud_by_particle"), mat.source_global_id)
+
+        # Resize each tile to its grid cell size, ensure writable, draw label.
+        # ROW1+ROW2 cells are 480x360; ROW3 cells are 960x360.
+        def _prep_tile(name, target_w):
             img, gid = cells_imgs[name]
-            if img.shape[:2] != (self.TILE_H, self.TILE_W):
-                img = cv2.resize(img, (self.TILE_W, self.TILE_H), interpolation=cv2.INTER_AREA)
+            if img.shape[:2] != (self.TILE_H, target_w):
+                img = cv2.resize(img, (target_w, self.TILE_H), interpolation=cv2.INTER_AREA)
             else:
                 img = img.copy() if img.flags.writeable else img.copy()
             stale = max(0, rs.source_global_id - gid) if gid >= 0 else 0
@@ -928,15 +930,21 @@ class Recorder(threading.Thread):
             _draw_tile_label(img, name, self.trackers[stream_name].fps(),
                               gid=gid, stale=stale)
             cells_imgs[name] = (img, gid)
+        for name in self.ROW1 + self.ROW2:
+            _prep_tile(name, self.TILE_W)
+        for name in self.ROW3:
+            _prep_tile(name, self.WIDE_TILE_W)
 
-        # Compose 4x2 grid then h-stack the sidebar.
+        # Compose: stack ROW1 above ROW2 (both 4x480), then stack ROW3 (2x960)
+        # below. Vstack handles the equal-width case since 4*480 == 2*960.
         row1 = np.hstack([cells_imgs[n][0] for n in self.ROW1])
         row2 = np.hstack([cells_imgs[n][0] for n in self.ROW2])
-        grid = np.vstack([row1, row2])
+        row3 = np.hstack([cells_imgs[n][0] for n in self.ROW3])
+        grid = np.vstack([row1, row2, row3])
 
-        # Total FPS = fusion rate (most downstream stage that depends on
+        # Total FPS = matter rate (most downstream stage that depends on
         # depth + flow + features). All tile stales feed off rs.gid.
-        total_fps = self.trackers["fusion"].fps()
+        total_fps = self.trackers["matter"].fps()
         sidebar = _perf_sidebar(
             self.slots, self.trackers,
             t_rec_start=self.t_start, source_thread=self.source_thread,
@@ -945,6 +953,7 @@ class Recorder(threading.Thread):
             dropped_ticks=self.dropped_ticks,
             max_lag_ms=self.max_lag_ms,
             src_idx_at_rec_start=self.src_idx_at_rec_start,
+            height=self.H,
         )
         return np.hstack([grid, sidebar])
 
@@ -1010,9 +1019,33 @@ def _transcode_to_h264(in_path, out_path):
     return True
 
 
+def _warm_threadpool_controller():
+    """Prime sklearn's threadpoolctl controller in the MAIN thread before any
+    worker threads spawn.
+
+    ``threadpoolctl`` lazy-initializes by walking every loaded ``.so`` via
+    ``dl_iterate_phdr`` and ``realpath``-ing each path to detect OpenMP/BLAS
+    pools.  With JAX + Torch + Numpy + cv2 + sklearn loaded the list runs to
+    several hundred libraries; the first call can take minutes on this system
+    and hangs the process at "entering K-means hierarchical init" if it
+    happens inside MatterWorker's thread while that thread is holding the
+    GPU semaphore (blocking depth/flow/feature workers indefinitely).
+
+    Warming the controller from the main thread converts the hang into a
+    one-time cold-start cost during ``main()``, after which sklearn KMeans in
+    MatterWorker hits the cached controller and returns in ~0.1 s.
+    """
+    try:
+        from sklearn.utils.parallel import _get_threadpool_controller
+        _get_threadpool_controller()
+    except Exception as e:
+        print(f"[warm_threadpool_controller] non-fatal: {e!r}", flush=True)
+
+
 def main(out_path="assets/streaming_demo.mp4", duration=10.0, fps=30,
-         uncapped_source=False, source_fps=30):
-    slots = {k: Slot(name=k) for k in ["rgb","depth","flow","features","fusion"]}
+         uncapped_source=False, source_fps=30, config_path=None):
+    _warm_threadpool_controller()
+    slots = {k: Slot(name=k) for k in ["rgb","depth","flow","features","matter"]}
 
     STOP.clear()
     # Source pacing: throttle_fps=False disables — workers run flat-out and
@@ -1020,19 +1053,33 @@ def main(out_path="assets/streaming_demo.mp4", duration=10.0, fps=30,
     src_throttle = False if uncapped_source else source_fps
     source = FrameSource("assets/test.mp4", slots["rgb"],
                          throttle_fps=src_throttle, resize=RESIZE)
+    matter_worker = MatterWorker(slots["depth"], slots["flow"], slots["features"],
+                                  slots["rgb"], slots["matter"],
+                                  config_path=config_path)
     workers = [
         source,
         DepthWorker(slots["rgb"], slots["depth"]),
         FlowWorker(slots["rgb"], slots["flow"]),
         FeatureWorker(slots["rgb"], slots["features"]),
-        FusionWorker(slots["depth"], slots["flow"], slots["rgb"],
-                     slots["features"], slots["fusion"]),
+        matter_worker,
     ]
     for w in workers:
         w.start()
 
-    # Let the pipeline warm up so first frames already have every stream alive.
+    # Let the perception workers warm up so the MatterWorker has every stream
+    # available on its first iteration.  Then block until MatterWorker
+    # finishes its (slow) K-means + Gibbs warm-up + JIT compile, so the
+    # Recorder doesn't start with an empty matter tile.
     time.sleep(1.5)
+    print("waiting for MatterWorker init (K-means + JIT compile)...")
+    t_wait = time.monotonic()
+    while not slots["matter"].snapshot().valid:
+        if time.monotonic() - t_wait > 180:
+            print("WARNING: MatterWorker did not produce output in 180s; "
+                  "continuing anyway")
+            break
+        time.sleep(0.5)
+    print(f"MatterWorker init done in {time.monotonic() - t_wait:.1f}s")
 
     args_state = {
         "uncapped_source": uncapped_source,
@@ -1054,8 +1101,15 @@ def main(out_path="assets/streaming_demo.mp4", duration=10.0, fps=30,
     print(f"wrote {rec.frames_written} frames ({rec.frames_written / fps:.2f} s)")
     print(f"dropped ticks: {rec.dropped_ticks}, max lag: {rec.max_lag_ms:.1f} ms")
     print(f"final per-stream FPS:")
-    for k in ["rgb","depth","flow","features","fusion"]:
+    for k in ["rgb","depth","flow","features","matter"]:
         print(f"  {k:<8} {rec.trackers[k].fps():5.2f}")
+
+    hist = matter_worker._outlier_history
+    if hist:
+        arr = np.array(hist, dtype=np.float32)
+        p95 = float(np.percentile(arr, 95))
+        print(f"matter outlier_frac: n={len(arr)} mean={arr.mean():.4f} "
+              f"max={arr.max():.4f} p95={p95:.4f}")
 
     print(f"transcoding to h264 → {out_path}")
     if _transcode_to_h264(tmp_path, out_path):
@@ -1078,6 +1132,11 @@ if __name__ == "__main__":
     p.add_argument("--uncapped-source", action="store_true",
                    help="Disable source pacing — workers run flat-out, "
                         "viewer sees true achievable throughput.")
+    p.add_argument("--config", default=None,
+                   help="YAML hyperparameter config for MatterWorker "
+                        "(default: configs/streaming_default.yaml; pass "
+                        "configs/streaming_tuned.yaml to use bayesopt output).")
     args = p.parse_args()
     main(out_path=args.out, duration=args.duration, fps=args.fps,
-         uncapped_source=args.uncapped_source, source_fps=args.source_fps)
+         uncapped_source=args.uncapped_source, source_fps=args.source_fps,
+         config_path=args.config)
