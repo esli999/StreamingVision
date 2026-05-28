@@ -1,7 +1,13 @@
-"""Ax BayesOpt runner: 64 Sobol then LCB forever."""
+"""Ax BayesOpt runner: Sobol then BoTorch-Modular (qNEHVI for multi-objective).
+
+Multi-video runs surface every video as an independent Ax objective so the
+optimizer sees the Pareto front of per-video IoUs directly — no scalarized
+softmin/mean aggregation as a proxy for "all videos must do well".
+"""
 
 from __future__ import annotations
 
+import gc
 import json
 import time
 from datetime import datetime, timezone
@@ -11,8 +17,20 @@ from typing import Any
 import numpy as np
 import yaml
 
+
+def _rss_gb() -> float:
+    """Resident RAM of this process, in GB.  Linux /proc only — returns 0
+    on platforms without it (so the call site stays branch-free)."""
+    try:
+        with open('/proc/self/status') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    return float(line.split()[1]) / (1024 * 1024)
+    except Exception:
+        pass
+    return 0.0
+
 from genmatter.bayesopt.config import load_bayesopt_config
-from genmatter.bayesopt.lcb import propose_lcb
 from genmatter.bayesopt.objective import (
     PRIMARY_METRIC_KEY,
     MultiVideoTrackingObjective,
@@ -64,7 +82,22 @@ def _build_generation_strategy(bo_cfg: dict[str, Any], sobol_seed: int) -> Any:
     )
 
 
-def _create_ax_client(bo_cfg: dict[str, Any], specs: list, run_id: str) -> Any:
+def _create_ax_client(
+    bo_cfg: dict[str, Any],
+    specs: list,
+    run_id: str,
+    objective_names: list[str],
+    *,
+    per_video_iou_threshold: float = 0.3,
+) -> Any:
+    """Build the Ax client.  With >1 objective name, ``BOTORCH_MODULAR``
+    auto-detects multi-objective and switches the acquisition to qNEHVI.
+
+    ``per_video_iou_threshold`` is the qNEHVI hypervolume reference point —
+    any per-video IoU below this value contributes zero to hypervolume.
+    Pick low enough that v1-broken trials don't poison the bookkeeping
+    (0.3 vs the 0.55 accuracy-gate target).
+    """
     from ax.service.ax_client import AxClient
     from ax.service.utils.instantiation import ObjectiveProperties
 
@@ -72,24 +105,108 @@ def _create_ax_client(bo_cfg: dict[str, Any], specs: list, run_id: str) -> Any:
     gs = _build_generation_strategy(bo_cfg, sobol_seed)
     client = AxClient(generation_strategy=gs, verbose_logging=False)
     parameters = [s.to_ax_dict() for s in specs]
+    if len(objective_names) == 1:
+        objectives = {objective_names[0]: ObjectiveProperties(minimize=False)}
+    else:
+        objectives = {
+            name: ObjectiveProperties(minimize=False, threshold=float(per_video_iou_threshold))
+            for name in objective_names
+        }
     client.create_experiment(
         name=run_id,
         parameters=parameters,
-        objectives={OBJECTIVE_NAME: ObjectiveProperties(minimize=False)},
+        objectives=objectives,
     )
     return client
 
 
-def _replay_trials(ax_client: Any, rows: list[dict[str, Any]]) -> None:
+def _replay_trials(
+    ax_client: Any,
+    rows: list[dict[str, Any]],
+    objective_names: list[str],
+) -> None:
     replayable = sorted(
         [r for r in rows if r.get("status") in ("completed", "invalid")],
         key=lambda r: int(r["trial_index"]),
     )
     for row in replayable:
         params = dict(row["params"])
-        ax_obj = float(row.get("ax_objective", row["objective"]))
+        raw_data = _row_per_video_objectives(row, objective_names)
         _, tid = ax_client.attach_trial(parameters=params)
-        ax_client.complete_trial(trial_index=tid, raw_data={OBJECTIVE_NAME: ax_obj})
+        ax_client.complete_trial(trial_index=tid, raw_data=raw_data)
+
+
+def _warm_start_attach(
+    ax_client: Any,
+    cfg: Any,
+    *,
+    warm_start_cfg: dict[str, Any],
+    objective_names: list[str],
+    trials_path: Path,
+    events_path: Path,
+    run_root: Path,
+    param_names: list[str],
+    resolved_model_params_dict: Any,
+    ui: Any,
+) -> None:
+    """Attach a previously-evaluated trial (the v1 winner) as Ax's first arm.
+
+    Reads the trial record yaml emitted by `save_trial_artifacts`, replays
+    the params + per-video scores, and writes a synthetic row to
+    `trials.jsonl` so a subsequent resume sees the warm-start point as
+    trial 0.  Falls back gracefully (with a UI warning) if the file is
+    missing or malformed — the long run can still proceed without warm
+    start.
+    """
+    base_root = Path(cfg.paths.custom_videos_root) if hasattr(cfg, "paths") else Path("assets/custom_videos")
+    src_video = str(warm_start_cfg.get("video_id"))
+    src_run = str(warm_start_cfg.get("run_id"))
+    src_trial = int(warm_start_cfg.get("trial_index"))
+    record = base_root / src_video / "bayesopt" / src_run / "trials" / f"trial_{src_trial:05d}.yaml"
+    if not record.is_file():
+        ui.print(f"[yellow]warm_start record not found:[/] {record} — skipping")
+        return
+    with open(record, encoding="utf-8") as f:
+        prev = yaml.safe_load(f) or {}
+    params = dict(prev.get("params", {}))
+    if not params:
+        ui.print(f"[yellow]warm_start trial has no params:[/] {record} — skipping")
+        return
+    raw_data = _row_per_video_objectives(prev, objective_names)
+    _, tid = ax_client.attach_trial(parameters=params)
+    ax_client.complete_trial(trial_index=tid, raw_data=raw_data)
+
+    # Persist a synthetic row so resume sees this warm-start.  Copy the
+    # per-video block + diagnostics from the source so the run_dir behaves
+    # like a normal trial in every other code path.
+    row = {
+        "trial_index": tid,
+        "phase": "warm_start",
+        "params": params,
+        "objective": float(prev.get("objective", 0.0)),
+        "ax_objective": float(prev.get("ax_objective", prev.get("objective", 0.0))),
+        "status": "completed",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "warm_start_source": {"video_id": src_video, "run_id": src_run, "trial_index": src_trial},
+        "per_video": prev.get("per_video", []),
+        "softmin_primary": prev.get("softmin_primary"),
+        "mean_primary": prev.get("mean_primary"),
+        "softmin_tau": prev.get("softmin_tau"),
+        "min_video_primary": prev.get("min_video_primary"),
+        "max_video_primary": prev.get("max_video_primary"),
+        "mean_outlier_pct": prev.get("mean_outlier_pct"),
+        "max_outlier_pct_per_video": prev.get("max_outlier_pct_per_video"),
+        "elapsed_seconds": 0.0,
+    }
+    append_jsonl(trials_path, row)
+    append_jsonl(events_path, {"event": "warm_start", **row})
+    save_trial_artifacts(
+        run_root,
+        row,
+        param_names=param_names,
+        resolved_hyperparams=resolved_model_params_dict(params),
+    )
+    ui.print(f"[green]warm_start attached:[/] {record.name} → trial {tid}")
 
 
 def _lcb_generation_node_name(gs: Any) -> str | None:
@@ -125,7 +242,43 @@ def _resolved_model_params_dict(
 
 
 def _phase_name(completed: int, n_sobol: int) -> str:
-    return "sobol" if completed < n_sobol else "bo_lcb"
+    return "sobol" if completed < n_sobol else "bo_moo"
+
+
+def _objective_names(video_ids: list[str]) -> list[str]:
+    """Per-video Ax objective names used for multi-objective optimization.
+
+    Single-video runs collapse to ``[OBJECTIVE_NAME]`` so the existing
+    single-objective TrackingObjective path keeps working.
+    """
+    if len(video_ids) <= 1:
+        return [OBJECTIVE_NAME]
+    return [f"iou_{vid}" for vid in video_ids]
+
+
+def _row_per_video_objectives(row: dict[str, Any], objective_names: list[str]) -> dict[str, tuple[float, float]]:
+    """Resolve per-objective values for an already-evaluated trial row.
+
+    Reads per-video IoU from ``row["per_video"]`` (written by the
+    MultiVideoTrackingObjective) and applies the same outlier penalty
+    used at evaluation time so resumed Ax sees the original BO targets.
+    On invalid trials, the per-video score collapses to 0.0 (each video's
+    contribution to hypervolume is zero).
+    """
+    if len(objective_names) == 1:
+        return {objective_names[0]: (float(row.get("ax_objective", row.get("objective", 0.0))), 0.0)}
+    per_video = row.get("per_video", []) or []
+    by_vid = {pv["video_id"]: pv for pv in per_video}
+    out: dict[str, tuple[float, float]] = {}
+    for name in objective_names:
+        vid = name[len("iou_"):]
+        pv = by_vid.get(vid)
+        if pv is None:
+            out[name] = (0.0, 0.0)
+            continue
+        score = float(pv.get("avg_persistent_iou", 0.0)) if pv.get("valid", True) else 0.0
+        out[name] = (score, 0.0)
+    return out
 
 
 def run_bayesopt_forever(
@@ -176,9 +329,17 @@ def run_bayesopt_forever(
 
     rows = read_jsonl(trials_path) if resume else []
     param_names = [s.name for s in specs]
-    ax_client = _create_ax_client(bo_cfg, specs, rid)
+    objective_names = _objective_names(video_ids)
+    phase_cfg_early = bo_cfg.get("phase", {})
+    ax_client = _create_ax_client(
+        bo_cfg,
+        specs,
+        rid,
+        objective_names,
+        per_video_iou_threshold=float(phase_cfg_early.get("per_video_iou_threshold", 0.3)),
+    )
     if rows:
-        _replay_trials(ax_client, rows)
+        _replay_trials(ax_client, rows, objective_names)
         valid_completed = len([r for r in rows if r.get("status") == "completed"])
         _sync_generation_strategy(ax_client, valid_completed=valid_completed, n_sobol=n_sobol)
         backfill_trial_artifacts(
@@ -190,12 +351,28 @@ def run_bayesopt_forever(
         )
 
     max_outlier_pct = float(bo_cfg.get("objective", {}).get("max_outlier_pct", 10.0))
+    phase_cfg = bo_cfg.get("phase", {})
+    parallel_videos = int(phase_cfg.get("parallel_videos", 1))
     if multi_video:
         ctxs = build_multi_objective_contexts(cfg, video_ids, bo_cfg=bo_cfg)
-        objective = MultiVideoTrackingObjective(ctxs, max_outlier_pct=max_outlier_pct)
+        subsets_by_phase: dict[str, list[str]] = {}
+        sobol_subset = phase_cfg.get("sobol_video_subset")
+        if sobol_subset:
+            subsets_by_phase["sobol"] = list(sobol_subset)
+        lcb_subset = phase_cfg.get("lcb_video_subset")
+        if lcb_subset:
+            subsets_by_phase["bo_moo"] = list(lcb_subset)
+        objective = MultiVideoTrackingObjective(
+            ctxs,
+            max_outlier_pct=max_outlier_pct,
+            softmin_tau=float(phase_cfg.get("softmin_tau", 4.0)),
+            subsets_by_phase=subsets_by_phase or None,
+            parallel_videos=parallel_videos,
+        )
     else:
         ctx: ObjectiveContext = build_objective_context(cfg, primary_video_id, bo_cfg=bo_cfg)
         objective = TrackingObjective(ctx, max_outlier_pct=max_outlier_pct)
+
     ui = BayesOptConsole()
     ui.start()
 
@@ -212,38 +389,57 @@ def run_bayesopt_forever(
 
     valid_completed = len([r for r in rows if r.get("status") == "completed"])
     trial_counter = len([r for r in rows if r.get("status") in ("completed", "invalid", "failed")])
-    lcb_seed_offset = 0
     invalid_count = len([r for r in rows if r.get("status") == "invalid"])
+
+    # Warm-start: attach a previously-evaluated trial (typically the v1
+    # winner) as Ax's first arm so the surrogate has a known-good Pareto
+    # point before Sobol begins.  No-op on resume — the existing
+    # trials.jsonl already carries it.
+    if not rows:
+        warm_start_cfg = phase_cfg.get("warm_start")
+        if warm_start_cfg:
+            _warm_start_attach(
+                ax_client,
+                cfg,
+                warm_start_cfg=warm_start_cfg,
+                objective_names=objective_names,
+                trials_path=trials_path,
+                events_path=events_path,
+                run_root=run_root,
+                param_names=param_names,
+                resolved_model_params_dict=lambda p: _resolved_model_params_dict(cfg, p),
+                ui=ui,
+            )
+            # Refresh counters now that a row was appended.
+            rows = read_jsonl(trials_path)
+            valid_completed = len([r for r in rows if r.get("status") == "completed"])
+            trial_counter = len([r for r in rows if r.get("status") in ("completed", "invalid", "failed")])
 
     ui.print(f"[bold]BayesOpt run[/] {run_root}")
     ui.print(
         f"Trial log: {trials_path} | per-trial params: {run_root / 'trials'}/ | "
         f"summary: {trials_summary_path(run_root)}"
     )
+    moo_tag = "multi-objective qNEHVI" if multi_video else "single-objective EI"
     ui.print(
         f"Video{'s' if multi_video else ''}: {','.join(video_ids)} | "
-        f"objective={PRIMARY_METRIC_KEY}{'(mean across videos)' if multi_video else ''} | "
+        f"objectives={len(objective_names)} ({moo_tag}) | "
         f"dims={len(specs)} ({', '.join(param_names)}) | "
-        f"Sobol={n_sobol} then LCB | max outlier %={max_outlier_pct:.1f} (Ctrl+C to stop)"
+        f"Sobol={n_sobol} then BoTorch | "
+        f"parallel_videos={parallel_videos} | "
+        f"max outlier %={max_outlier_pct:.1f} (Ctrl+C to stop)"
     )
 
     try:
         while True:
             phase = _phase_name(valid_completed, n_sobol)
-            if phase == "sobol":
-                params, trial_index = ax_client.get_next_trial()
-            else:
-                params, trial_index = propose_lcb(
-                    ax_client,
-                    specs,
-                    pool_size=int(bo_cfg["phase"].get("candidate_pool_size", 4096)),
-                    beta=float(bo_cfg["phase"].get("lcb_beta", 2.0)),
-                    seed=int(bo_cfg["run"]["master_seed"]) + lcb_seed_offset,
-                    objective_name=OBJECTIVE_NAME,
-                )
-                lcb_seed_offset += 1
+            if hasattr(objective, "set_phase"):
+                objective.set_phase(phase)
+            params, trial_index = ax_client.get_next_trial()
 
-            measure_fps = trial_counter == 0
+            # measure_fps would corrupt timings across concurrent workers,
+            # so disable whenever the trial fans out into multiple videos.
+            measure_fps = (trial_counter == 0) and (parallel_videos <= 1)
             ui.update(
                 {
                     "phase": phase,
@@ -275,9 +471,13 @@ def run_bayesopt_forever(
                 ui.print(f"[red]Trial {trial_index} failed:[/] {exc}")
 
             if status in ("completed", "invalid", "failed"):
-                ax_client.complete_trial(
-                    trial_index=trial_index, raw_data={OBJECTIVE_NAME: ax_obj}
-                )
+                # Build per-objective raw_data so multi-video runs feed each
+                # video's IoU to Ax separately; the per-video penalty mirrors
+                # the scalar ax_objective in the single-video case.
+                row_for_ax = {"per_video": meta.get("per_video", []),
+                               "ax_objective": ax_obj, "objective": score}
+                raw_data = _row_per_video_objectives(row_for_ax, objective_names)
+                ax_client.complete_trial(trial_index=trial_index, raw_data=raw_data)
                 trial_counter += 1
 
             if status == "completed":
@@ -319,6 +519,26 @@ def run_bayesopt_forever(
             }
             ui.update(trial_status)
             ui.log_trial(trial_status)
+
+            # Memory-leak mitigation.  Without this, RSS climbs ~0.7 GB/trial
+            # on a 7-video MO run (Ax holds per-trial data + JAX in-memory HLO
+            # caches accumulate), hitting host RAM OOM around trial 35 on a
+            # 62 GB box.  gc.collect() reclaims dangling Python refs; clearing
+            # JAX's in-memory cache forces re-resolution from the on-disk
+            # persistent cache (.jax_cache/) — ~5 s vs ~90 s cold compile.
+            rss_before = _rss_gb()
+            gc.collect()
+            if trial_counter % 5 == 0:
+                try:
+                    import jax
+                    jax.clear_caches()
+                except Exception:
+                    pass
+            rss_after = _rss_gb()
+            ui.print(
+                f"[dim]post-gc RSS {rss_before:.1f} → {rss_after:.1f} GB "
+                f"(trial {trial_counter}, jax_cache_clear={trial_counter % 5 == 0})[/]"
+            )
     except KeyboardInterrupt:
         ui.print("\n[yellow]Stopped by user.[/]")
     finally:

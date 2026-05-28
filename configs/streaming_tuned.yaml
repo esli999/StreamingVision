@@ -54,33 +54,37 @@ tracking:
   random_seed: 42
   focal_length: 520.0
   use_sam_frame0: true
-  init_gibbs_sweeps: 15
-  # Streaming pipeline calibration is different from the offline bayesopt
-  # cohort: with our frame-0 DINO PCA basis + DepthAnythingV2 min/max-normalized
-  # Z, the 32-dim feature log-lik baseline at sigma_F~4 lands around -76, head-
-  # to-head with log(1e-28)~-65 for the categorical outlier prior — so
-  # ~28-95% of datapoints flip to outlier per Gibbs sweep (verified by
-  # synthetic sweep on 2026-05-20). 1e-60 underflows to 0 in float32, so the
-  # outlier class gets log-prior -inf and never wins; outliers go to 0%.
-  tracking_outlier_prob: 1.0e-60
+  init_gibbs_sweeps: 21
+  tracking_outlier_prob: 1.0e-28
   dense_disable_outlier_prob: false
+  # Self-supervised calibration (Step 2): if true, sigma_F / sigma_F_H below are
+  # OVERRIDDEN at init by the empirical within-cluster DINO feature variance
+  # (~0.5 / ~0.4 on test).  OFFLINE (scripts/diagnose_streaming.py, cached
+  # ~zero-velocity motion) this lifts live-clusters<->SAM ARI 0.06 -> 0.52 and
+  # drops outlier_frac 0.20 -> 0.02.  But in the LIVE demo it REGRESSES outlier
+  # (0.25 -> 0.58): tight sigma_F ejects the feature mismatches the live
+  # SEA-RAFT/depth + looping-during-init regime produces, exactly the
+  # "sigma_F<0.5 -> everything outlier" failure the bayesopt sigma_F=9.04 avoided.
+  # Left OFF pending a live-depth/flow diagnose harness to tune for that regime.
+  calibrate_feature_sigmas: false
   blob_counting_threshold: 0
   hyperparams:
-    sigma_F: 4.38792196017069
-    outlier_prob: 4.525842704512471
-    outlier_velocity_gamma_shape: 4.597982224076986
-    outlier_velocity_gamma_rate: 0.11512864600818656
-    alpha: 0.3646241983230548
-    beta: 1.8264660163540756
-    sigma_H: 91.86612408596491
-    sigma_V: 123807185197582.55
-    translation_gaussian_scale: 0.28259877599775796
-    translation_max_radius: 0.5680604964494704
-    translation_num_radii_cells: 12
-    translation_theta_step_deg: 19.571981206536293
-    rotation_vmf_kappa: 124.58396655909301
-    rotation_angle_max_deg: 17.787536066025496
-    rotation_angle_step_deg: 0.9157716024849818
+    sigma_F: 9.044196019192926
+    sigma_F_H: 2.0
+    outlier_prob: 2.368796593121853
+    outlier_velocity_gamma_shape: 1.6884034699760377
+    outlier_velocity_gamma_rate: 2.2876265650213488
+    alpha: 1.6833335733111996
+    beta: 2.568945821899056
+    sigma_H: 20.433032973338854
+    sigma_V: 17719855363262.03
+    translation_gaussian_scale: 0.4676176212728024
+    translation_max_radius: 0.42811625488102434
+    translation_num_radii_cells: 17
+    translation_theta_step_deg: 23.25428342446685
+    rotation_vmf_kappa: 114.48296422989405
+    rotation_angle_max_deg: 19.748530313372612
+    rotation_angle_step_deg: 0.2130881153213785
 viz:
   pipeline:
     skip_existing: false
@@ -94,5 +98,18 @@ viz:
   include_flow: true
   include_depth: true
 _meta:
-  source: bayesopt 20260521_000113 trial 26
-  objective_avg_mean_gt_iou: null
+  source: bayesopt v3_moo_3hr trial 36
+  pick_by: min
+  per_video_min_persistent_iou: 0.27885445926174496
+  per_video_max_persistent_iou: 0.9169814296764947
+  mean_persistent_iou: 0.6338333354879983
+  per_video_persistent_iou:
+    gray_jacket: 0.5705885580978912
+    jello_trim: 0.4626123311798245
+    new_eagle_trim: 0.7361149210358765
+    purple_jacket: 0.27885445926174496
+    snake_trim: 0.879981959362897
+    wine_swirl: 0.9169814296764947
+    two_blocks_centered: 0.5916996898012589
+  softmin_persistent_iou: 0.46418671782409965
+  softmin_tau: 4.0

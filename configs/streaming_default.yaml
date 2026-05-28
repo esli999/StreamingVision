@@ -71,10 +71,15 @@ tracking:
   init_gibbs_sweeps: 15
   tracking_outlier_prob: 1.0e-28
   dense_disable_outlier_prob: false
+  # Step 2 (self-supervised calibration): when true, sigma_F / sigma_F_H below
+  # are ignored and replaced at init by the empirical within-cluster DINO
+  # feature variance estimated from the k-means seed.
+  calibrate_feature_sigmas: false
   blob_counting_threshold: 0
 
   hyperparams:
     sigma_F: 2.0
+    sigma_F_H: 2.0
     outlier_prob: 5.0
     outlier_velocity_gamma_shape: 5.0
     outlier_velocity_gamma_rate: 1.0

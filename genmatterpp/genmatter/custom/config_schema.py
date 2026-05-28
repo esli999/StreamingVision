@@ -95,6 +95,7 @@ class PreprocessConfig:
 @dataclass
 class TrackingHyperparamsConfig:
     sigma_F: float = 2.0
+    sigma_F_H: float = 2.0
     outlier_prob: float = 5.0
     outlier_velocity_gamma_shape: float = 5.0
     outlier_velocity_gamma_rate: float = 1.0
@@ -129,6 +130,7 @@ class TrackingConfig:
     init_gibbs_sweeps: int = 15
     tracking_outlier_prob: float = 1e-28
     dense_disable_outlier_prob: bool = False
+    calibrate_feature_sigmas: bool = False
     blob_counting_threshold: int = 0
     measure_fps: bool = True
     hyperparams: TrackingHyperparamsConfig = field(default_factory=TrackingHyperparamsConfig)

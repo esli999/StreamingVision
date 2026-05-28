@@ -62,6 +62,7 @@ def configure_jax_cache(cache_dir: str | None = None) -> Path:
 @dataclass
 class DinoTrackingHyperparams:
     sigma_F: float = 0.2
+    sigma_F_H: float = 2.0          # per-hyperblob feature likelihood variance (semantic clusters)
     outlier_prob: float = 5.0
     outlier_velocity_gamma_shape: float = 5.0
     outlier_velocity_gamma_rate: float = 1.0
@@ -89,6 +90,7 @@ class DinoTrackingParams:
     init_gibbs_sweeps: int = 15
     tracking_outlier_prob: float = 1e-28
     dense_disable_outlier_prob: bool = False
+    calibrate_feature_sigmas: bool = False
     measure_fps: bool = True
     hyperparams: DinoTrackingHyperparams = field(default_factory=DinoTrackingHyperparams)
 
@@ -148,9 +150,13 @@ def dino_params_from_config(tracking_cfg) -> DinoTrackingParams:
         dense_disable_outlier_prob=getattr(
             tracking_cfg, "dense_disable_outlier_prob", False
         ),
+        calibrate_feature_sigmas=getattr(
+            tracking_cfg, "calibrate_feature_sigmas", False
+        ),
         measure_fps=getattr(tracking_cfg, "measure_fps", True),
         hyperparams=DinoTrackingHyperparams(
             sigma_F=hp.sigma_F,
+            sigma_F_H=getattr(hp, "sigma_F_H", 2.0),
             outlier_prob=hp.outlier_prob,
             outlier_velocity_gamma_shape=hp.outlier_velocity_gamma_shape,
             outlier_velocity_gamma_rate=hp.outlier_velocity_gamma_rate,
@@ -191,6 +197,7 @@ class GenMatter_Hyperparams_DINO(Super_Pytree):
     mu_F: jnp.ndarray = Super_Pytree.field()
     sigma_F_prior: jnp.ndarray = Super_Pytree.field()
     sigma_F: jnp.float32 = Super_Pytree.field()
+    sigma_F_H: jnp.float32 = Super_Pytree.field()
     translation_max_radius: StaticJnp = Super_Pytree.static()
     translation_num_radii_cells: StaticJnp = Super_Pytree.static()
     translation_theta_step_deg: StaticJnp = Super_Pytree.static()
@@ -234,15 +241,45 @@ class GenMatter_Datapoints_State_DINO(Super_Pytree):
     datapoint_features: jnp.ndarray
 
 @Pytree.dataclass
+class GenMatter_Hyperblobs_State_DINO(Super_Pytree):
+    hyperblob_weights: jnp.ndarray
+    hyperblob_means: jnp.ndarray
+    hyperblob_covs: jnp.ndarray
+    hyperblob_trans_vels: jnp.ndarray
+    hyperblob_rot_vels: jnp.ndarray
+    hyperblob_features: jnp.ndarray          # (K, D) per-cluster DINO feature mean
+
+@gen
+def GenMatter_hyperblobs_model_dino(hypers: GenMatter_Hyperparams_DINO):
+    """Hyperblob (cluster) prior with a DINO feature mean per cluster.  Mirrors
+    model_3d.GenMatter_hyperblobs_model + a hyperblob_features term so clusters
+    can be semantic, not just kinematic."""
+    sample_shape = Const((hypers.n_hyperblobs,))
+    hyperblob_weights = genjax.dirichlet(jnp.repeat(hypers.alpha, hypers.n_hyperblobs)) @ 'hyperblob_weights'
+    hyperblob_covs = inverse_wishart(hypers.nu_H, hypers.Psi_H, sample_shape=sample_shape) @ 'hyperblob_covs'
+    hyperblob_means = genjax.normal(hypers.mu_H, jnp.sqrt(hypers.sigma_H), sample_shape=sample_shape) @ 'hyperblob_means'
+    hyperblob_trans_vels = discrete_categorical(hypers.discrete_translation, sample_shape=sample_shape) @ 'hyperblob_trans_vels'
+    hyperblob_rot_vels = discrete_categorical(hypers.discrete_rotation, sample_shape=sample_shape) @ 'hyperblob_rot_vels'
+    hyperblob_features = genjax.normal(hypers.mu_F, jnp.sqrt(hypers.sigma_F_prior**2), sample_shape=sample_shape) @ 'hyperblob_features'
+    return GenMatter_Hyperblobs_State_DINO(
+        hyperblob_weights=hyperblob_weights,
+        hyperblob_means=hyperblob_means,
+        hyperblob_covs=hyperblob_covs,
+        hyperblob_trans_vels=hyperblob_trans_vels,
+        hyperblob_rot_vels=hyperblob_rot_vels,
+        hyperblob_features=hyperblob_features,
+    )
+
+@Pytree.dataclass
 class GenMatter_State_DINO(Super_Pytree):
     hypers: GenMatter_Hyperparams_DINO
-    hyperblobs_state: GenMatter_Hyperblobs_State
+    hyperblobs_state: GenMatter_Hyperblobs_State_DINO
     blobs_state: GenMatter_Blobs_State_DINO
     datapoints_state: GenMatter_Datapoints_State_DINO
 
 @gen
 def GenMatter_model_dino(hypers: GenMatter_Hyperparams_DINO):
-    hyperblobs_state = GenMatter_hyperblobs_model(hypers) @ 'hyperblobs'
+    hyperblobs_state = GenMatter_hyperblobs_model_dino(hypers) @ 'hyperblobs'
     blobs_state = GenMatter_blobs_model_dino(hypers, hyperblobs_state) @ 'blobs'
     datapoints_state = GenMatter_datapoints_model_dino(hypers, blobs_state) @ 'datapoints'
     return GenMatter_State_DINO(
@@ -273,7 +310,12 @@ def GenMatter_blobs_model_dino(hypers: GenMatter_Hyperparams_DINO, hyperblobs_st
     )
     blob_vel_means = genjax.normal(blob_vel_means_, jnp.sqrt(hypers.sigma_V)) @ 'blob_vel_means'
     blob_vel_covs = inverse_wishart(hypers.nu_V, hypers.Psi_V, sample_shape=sample_shape) @ 'blob_vel_covs'
-    blob_features = genjax.normal(hypers.mu_F, jnp.sqrt(hypers.sigma_F_prior**2)) @ 'blob_features'
+    # Blobs inherit their assigned hyperblob's feature mean (mirrors how blob_means
+    # is drawn from the hyperblob's mean), so cluster grouping becomes semantic.
+    blob_features = genjax.normal(
+        assigned_hyperblob_per_blob.hyperblob_features,
+        jnp.sqrt(hypers.sigma_F_H)
+    ) @ 'blob_features'
     return GenMatter_Blobs_State_DINO(
         hyperblob_assignments=hyperblob_assignments,
         blob_weights=blob_weights,
@@ -458,6 +500,77 @@ def gibbs_blob_features_dino(key, genmatter_state):
     posterior_std = jnp.where(has_points[:, None], posterior_std, sigma_F_prior[None, :])
     new_blob_features = genjax.normal.sample(posterior_key, posterior_mean, posterior_std)
     return genmatter_state.replace({'blobs_state': {'blob_features': new_blob_features}})
+
+
+# Likelihood for the blob->hyperblob assignment WITH a DINO feature term, so
+# cluster (hyperblob) membership is semantic, not just kinematic.  Mirrors
+# inference.hyperblob_blob_likelihood_model + a blob_feature term.
+@gen
+def hyperblob_blob_likelihood_model_dino(hyperblobs_state: GenMatter_Hyperblobs_State_DINO,
+                                         hypers: GenMatter_Hyperparams_DINO):
+    hyperblob_idx = genjax.categorical(probs=hyperblobs_state.hyperblob_weights) @ 'hyperblob_assignment'
+    hyperblob_state = hyperblobs_state[hyperblob_idx]
+    blob_mean = genjax.mv_normal(hyperblob_state.hyperblob_means, hyperblob_state.hyperblob_covs) @ 'blob_mean'
+    blob_vel_mean_ = hyperblob_state.hyperblob_trans_vels + jnp.matmul(
+        hyperblob_state.hyperblob_rot_vels - jnp.eye(3), blob_mean - hyperblob_state.hyperblob_means)
+    blob_vel_mean = genjax.normal(blob_vel_mean_, jnp.sqrt(hypers.sigma_V)) @ 'blob_vel'
+    blob_feature = genjax.normal(hyperblob_state.hyperblob_features, jnp.sqrt(hypers.sigma_F_H)) @ 'blob_feature'
+    return None
+
+
+def gibbs_hyperblob_assignments_dino(key, genmatter_state):
+    """Gibbs re-sample of which hyperblob each blob belongs to (un-freezes the
+    clusters), driven by position + velocity + DINO feature.  Native JAX:
+    nested vmap over (blobs, hyperblobs) + genjax.categorical.sample.  Mirrors
+    inference.gibbs_hyperblob_assignments with an added feature term."""
+    from genjax import ChoiceMapBuilder as C
+    posterior_key, _ = jax.random.split(key)
+    num_hyperblobs = genmatter_state.hypers.n_hyperblobs
+    num_blobs = genmatter_state.hypers.n_blobs
+    blob_means = genmatter_state.blobs_state.blob_means
+    blob_vel_means = genmatter_state.blobs_state.blob_vel_means
+    blob_features = genmatter_state.blobs_state.blob_features
+    hyperblobs_state = genmatter_state.hyperblobs_state
+    hypers = genmatter_state.hypers
+
+    def compute_local_density(blob_idx):
+        chm = (C["blob_mean"].set(blob_means[blob_idx])
+               | C["blob_vel"].set(blob_vel_means[blob_idx])
+               | C["blob_feature"].set(blob_features[blob_idx]))
+        return jax.vmap(
+            lambda i: hyperblob_blob_likelihood_model_dino.assess(
+                chm.at["hyperblob_assignment"].set(i), (hyperblobs_state, hypers))[0]
+        )(jnp.arange(num_hyperblobs))
+
+    local_densities = jax.vmap(compute_local_density)(jnp.arange(num_blobs))
+    updated_hyperblob_assignments = genjax.categorical.sample(posterior_key, logits=local_densities)
+    return genmatter_state.replace({'blobs_state': {'hyperblob_assignments': updated_hyperblob_assignments}})
+
+
+def gibbs_hyperblob_features_dino(key, genmatter_state):
+    """Conjugate Normal-Normal update of per-hyperblob DINO feature means,
+    aggregating blob_features by hyperblob_assignments.  Native JAX segment_sum;
+    mirrors gibbs_blob_features_dino one level up the hierarchy."""
+    posterior_key, _ = jax.random.split(key)
+    blob_features = genmatter_state.blobs_state.blob_features                 # (L, D)
+    hyperblob_assignments = genmatter_state.blobs_state.hyperblob_assignments  # (L,)
+    mu_F = genmatter_state.hypers.mu_F
+    sigma_F_prior = genmatter_state.hypers.sigma_F_prior
+    sigma_F_H = genmatter_state.hypers.sigma_F_H
+    K = genmatter_state.hypers.n_hyperblobs
+
+    N_k = jax.ops.segment_sum(jnp.ones(blob_features.shape[0]), hyperblob_assignments, num_segments=K)
+    S_k = stable_segment_sum(blob_features, hyperblob_assignments, K)
+    prior_precision = 1.0 / (sigma_F_prior ** 2)
+    likelihood_precision = 1.0 / sigma_F_H
+    posterior_precision = prior_precision[None, :] + N_k[:, None] * likelihood_precision
+    posterior_mean = (mu_F[None, :] * prior_precision[None, :] + S_k * likelihood_precision) / posterior_precision
+    posterior_std = 1.0 / jnp.sqrt(posterior_precision)
+    has_blobs = N_k > 0
+    posterior_mean = jnp.where(has_blobs[:, None], posterior_mean, mu_F[None, :])
+    posterior_std = jnp.where(has_blobs[:, None], posterior_std, sigma_F_prior[None, :])
+    new_hyperblob_features = genjax.normal.sample(posterior_key, posterior_mean, posterior_std)
+    return genmatter_state.replace({'hyperblobs_state': {'hyperblob_features': new_hyperblob_features}})
 
 
 @jax.jit
@@ -685,6 +798,10 @@ def blob_tracking_gibbs_dino(key, genmatter_state):
 
     def hyperblob_update_loop(i, carry):
         key, genmatter_state = carry
+        # Re-sample blob->hyperblob membership (feature-aware) so clusters adapt
+        # instead of staying frozen at the frame-0 k-means assignment.
+        key, gibbs_key = jax.random.split(key)
+        genmatter_state = gibbs_hyperblob_assignments_dino(gibbs_key, genmatter_state)
         key, gibbs_key = jax.random.split(key)
         genmatter_state = gibbs_hyperblob_means(gibbs_key, genmatter_state)
         key, gibbs_key = jax.random.split(key)
@@ -693,13 +810,16 @@ def blob_tracking_gibbs_dino(key, genmatter_state):
         genmatter_state = gibbs_hyperblob_rot(gibbs_key, genmatter_state)
         key, gibbs_key = jax.random.split(key)
         genmatter_state = gibbs_hyperblob_trans(gibbs_key, genmatter_state)
+        # Update each cluster's DINO feature mean from its member blobs (semantic).
+        key, gibbs_key = jax.random.split(key)
+        genmatter_state = gibbs_hyperblob_features_dino(gibbs_key, genmatter_state)
         return key, genmatter_state
 
     key, genmatter_state = jax.lax.fori_loop(0, 3, hyperblob_update_loop, (key, genmatter_state))
-    # # added this to see if it helps below
-    # key, genmatter_state = jax.lax.fori_loop(0, 3, update_blob_assignments_feature_only, (key, genmatter_state))
-    # # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    # Keep this schedule identical to run_davis_subsampling so 1/128 results match exactly.
+    # Feature-driven blob assignment refinement (DINO). Re-enabled (was disabled
+    # to keep the schedule identical to run_davis_subsampling 1/128) so semantic
+    # DINO features pull blob membership, not just position.
+    key, genmatter_state = jax.lax.fori_loop(0, 2, update_blob_assignments_feature_only, (key, genmatter_state))
     key, genmatter_state = jax.lax.fori_loop(0, 1, update_blob_assignments_position_only, (key, genmatter_state))
     key, genmatter_state = jax.lax.fori_loop(0, 15, update_blob_means, (key, genmatter_state))
     key, genmatter_state = jax.lax.fori_loop(0, 3, update_blob_features_dino, (key, genmatter_state))
@@ -954,7 +1074,55 @@ def _frame_data_from_trace(
     }
 
 
-def _build_hypers_from_kmeans(kmeans_chm, roi_blob_indices, roi_hyperblob_indices, num_hyperblobs, num_blobs, num_datapoints, gaussian_means, gaussian_stds, hp: DinoTrackingHyperparams):
+# Numerical floor for the calibrated feature variances so jnp.sqrt(sigma) can't
+# collapse to a degenerate (zero-width) likelihood when a partition is perfectly
+# tight.  Features are z-scored to per-dim std~=1, so a real within-cluster
+# variance lands well above this; the floor only guards the degenerate case.
+FEATURE_SIGMA_FLOOR = 1e-3
+
+
+def estimate_feature_sigmas_from_chm(kmeans_chm, num_hyperblobs):
+    """Closed-form empirical-Bayes (MLE) estimates of the model's scalar DINO
+    feature likelihood variances, for the ``calibrate_feature_sigmas`` seam.
+
+    ``sigma_F``  — within-blob feature variance: mean over datapoints & feature
+        dims of the squared residual of ``datapoint_features`` around their
+        assigned blob's ``blob_features`` mean.
+    ``sigma_F_H`` — within-hyperblob feature variance: the same one level up, for
+        ``blob_features`` around their hyperblob's segment-mean feature.
+
+    The model parameterizes these as variances
+    (``datapoint_features ~ N(blob_features, sqrt(sigma_F))`` and
+    ``blob_features ~ N(hyperblob_features, sqrt(sigma_F_H))``), so the MLE of
+    each variance given the k-means partition is exactly the mean squared
+    residual.  Native JAX (gather + segment_sum), no python loops; this runs
+    once at init, never in the per-frame path.  Returns
+    ``(sigma_F_est, sigma_F_H_est)`` as float32 jnp scalars.
+    """
+    datapoint_features = kmeans_chm["datapoints", "datapoint_features"]     # (N, D)
+    blob_assignments = kmeans_chm["datapoints", "blob_assignments"]         # (N,)
+    blob_features = kmeans_chm["blobs", "blob_features"]                    # (L, D)
+    hyperblob_assignments = kmeans_chm["blobs", "hyperblob_assignments"]    # (L,)
+
+    resid_F = datapoint_features - blob_features[blob_assignments]
+    sigma_F_est = jnp.mean(resid_F ** 2)
+
+    # Per-hyperblob feature mean = segment-mean of blob_features by hyperblob
+    # assignment (the same quantity init seeds 'hyperblob_features' with), then
+    # the within-hyperblob residual of blob_features.
+    counts = jax.ops.segment_sum(
+        jnp.ones((blob_features.shape[0], 1)),
+        hyperblob_assignments,
+        num_segments=num_hyperblobs,
+    )
+    sums = stable_segment_sum(blob_features, hyperblob_assignments, num_hyperblobs)
+    hyperblob_features = sums / jnp.maximum(counts, 1.0)
+    resid_F_H = blob_features - hyperblob_features[hyperblob_assignments]
+    sigma_F_H_est = jnp.mean(resid_F_H ** 2)
+    return sigma_F_est, sigma_F_H_est
+
+
+def _build_hypers_from_kmeans(kmeans_chm, roi_blob_indices, roi_hyperblob_indices, num_hyperblobs, num_blobs, num_datapoints, gaussian_means, gaussian_stds, hp: DinoTrackingHyperparams, *, calibrate_feature_sigmas: bool = False):
     empirical_mu_H = jnp.median(kmeans_chm["datapoints", "datapoint_positions"], axis=0)
     empirical_sigma_H = hp.sigma_H
     empirical_Psi_B = jnp.median(kmeans_chm["blobs", "blob_covs"][roi_blob_indices], axis=0)
@@ -969,10 +1137,22 @@ def _build_hypers_from_kmeans(kmeans_chm, roi_blob_indices, roi_hyperblob_indice
     ) / len(roi_blob_indices)
     empirical_nu_B = empirical_nu_V = f_(int(mean_points_per_roi_blob))
 
+    # Empirical-Bayes feature variances (Step 2): replace the YAML sigma_F /
+    # sigma_F_H with the within-partition feature variance estimated directly
+    # from the k-means seed, gated behind calibrate_feature_sigmas.
+    if calibrate_feature_sigmas:
+        sigma_F_est, sigma_F_H_est = estimate_feature_sigmas_from_chm(kmeans_chm, num_hyperblobs)
+        sigma_F_value = jnp.maximum(sigma_F_est, FEATURE_SIGMA_FLOOR)
+        sigma_F_H_value = jnp.maximum(sigma_F_H_est, FEATURE_SIGMA_FLOOR)
+    else:
+        sigma_F_value = f_(hp.sigma_F)
+        sigma_F_H_value = f_(getattr(hp, "sigma_F_H", 2.0))
+
     return GenMatter_Hyperparams_DINO.create(
         mu_F=jnp.array(gaussian_means),
         sigma_F_prior=jnp.array(gaussian_stds),
-        sigma_F=f_(hp.sigma_F),
+        sigma_F=f_(sigma_F_value),
+        sigma_F_H=f_(sigma_F_H_value),
         outlier_prob=f_(hp.outlier_prob),
         outlier_velocity_gamma_shape=f_(hp.outlier_velocity_gamma_shape),
         outlier_velocity_gamma_rate=f_(hp.outlier_velocity_gamma_rate),
@@ -1100,6 +1280,7 @@ def run_dino_tracking(
         gaussian_means,
         gaussian_stds,
         hp,
+        calibrate_feature_sigmas=params.calibrate_feature_sigmas,
     )
 
     key = jkey(params.random_seed)

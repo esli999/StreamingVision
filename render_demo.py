@@ -102,6 +102,7 @@ from torchvision.utils import flow_to_image
 from raft import RAFT
 
 import genmatter_rt
+import streaming_dino
 
 
 # ---------- Primitives ----------
@@ -181,18 +182,20 @@ sea_args = argparse.Namespace(**cfg); sea_args.iters = 4; sea_args.scale = 0
 flow_model = RAFT.from_pretrained("MemorySlices/Tartan-C-T-TSKH-spring540x960-M",
                                   args=sea_args).to(DEVICE).eval()
 
-dino_ckpt  = "facebook/dinov2-small"
-dino_proc  = AutoImageProcessor.from_pretrained(dino_ckpt)
-dino_model = AutoModel.from_pretrained(dino_ckpt, torch_dtype=torch.float16).to(DEVICE).eval()
+dino_model = streaming_dino.load_dino(DEVICE)
 print("models loaded.")
 
 
 # ---------- DINO feature kernels ----------
 
-# Number of patches DINOv2-S/14 produces at the 224x224 input the HF processor
-# resizes to: gh = gw = 16, so 256 patches. Fixed for jit shape stability.
-N_DINO_PATCHES = 256
-DINO_DIM       = 384
+# Denser DINO feature map (Workstream A): DINOv2-S/14 at DINO_H x DINO_W with
+# interpolated position embeddings -> DINO_GH x DINO_GW patches, aspect-matched
+# to the 640x360 frame (vs. the HF processor's 16x16 224 crop, which upsampled
+# ~5x onto the 80x45 tracking grid). Geometry + the forward kernel live in
+# streaming_dino so the offline calibration/debug scripts share them exactly.
+from streaming_dino import (
+    DINO_PATCH, DINO_H, DINO_W, DINO_GH, DINO_GW, N_DINO_PATCHES, DINO_DIM,
+)
 
 @jax.jit
 def fx_dino_pca(feats):
@@ -379,13 +382,11 @@ class FeatureWorker(threading.Thread):
             bgr = snap.payload["bgr"]
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             t0 = time.monotonic()
-            with GPU, torch.inference_mode():
-                inp = dino_proc(images=rgb, return_tensors="pt").to(DEVICE, dtype=torch.float16)
-                out = dino_model(**inp).last_hidden_state[0]
-                patches = out[1:]
-                feat_np = patches.float().cpu().numpy()
-                n = patches.shape[0]
-                gh = gw = int(round(np.sqrt(n)))
+            with GPU:
+                # Dense DINOv2-S patches at DINO_H x DINO_W via the shared
+                # streaming_dino kernel (manual resize + ImageNet normalize +
+                # interpolate_pos_encoding -> DINO_GH x DINO_GW grid).
+                feat_np, (gh, gw) = streaming_dino.dino_patches(dino_model, rgb, DEVICE)
 
             # Move features to JAX device and run PCA. Both operations release
             # the GIL; we explicitly block before publishing so wall_complete
@@ -466,7 +467,7 @@ class MatterWorker(threading.Thread):
     """
 
     def __init__(self, depth, flow, features, rgb, out, poll=0.001,
-                  intrinsics=None, config_path=None):
+                  intrinsics=None, config_path=None, sam_frame0_path=None):
         super().__init__(daemon=True, name="MatterWorker")
         self.depth, self.flow, self.features, self.rgb = depth, flow, features, rgb
         self.out, self.poll = out, poll
@@ -474,6 +475,21 @@ class MatterWorker(threading.Thread):
         self.yaml_cfg = genmatter_rt.load_yaml_hypers(config_path)
         self._num_blobs = int(self.yaml_cfg["tracking"]["num_blobs"])
         self._num_hyperblobs = int(self.yaml_cfg["tracking"]["num_hyperblobs"])
+        # SAM-anchored semantic init (Step 3): if tracking.use_sam_frame0 is set
+        # and the cached frame-0 SAM mask exists, load it (RGB) so init_state can
+        # seed one hyperblob per SAM instance.  Downsampled to the stride-8 grid
+        # at init time (once the frame size is known).  Missing mask -> graceful
+        # fallback to the flat k-means init.
+        self._sam_rgb_full = None
+        if self.yaml_cfg["tracking"].get("use_sam_frame0", False) and sam_frame0_path:
+            p = os.path.abspath(sam_frame0_path)
+            if os.path.isfile(p):
+                self._sam_rgb_full = cv2.cvtColor(cv2.imread(p, cv2.IMREAD_COLOR),
+                                                  cv2.COLOR_BGR2RGB)
+                print(f"[MatterWorker] SAM-frame-0 init enabled ({p})", flush=True)
+            else:
+                print(f"[MatterWorker] use_sam_frame0 set but mask missing ({p}); "
+                      f"falling back to k-means init", flush=True)
         self._last_d_v = self._last_f_v = self._last_ft_v = -1
         self._state = None
         self._indices = None
@@ -517,6 +533,15 @@ class MatterWorker(threading.Thread):
                     self._indices = genmatter_rt.subsample_indices(
                         h=h, w=w, stride=genmatter_rt.STRIDE,
                         n_keep=genmatter_rt.N_KEEP, seed=0)
+                    # Downsample the SAM mask to the stride-8 grid that
+                    # self._indices indexes into, so the per-datapoint instance
+                    # labels line up with `positions`.
+                    if self._sam_rgb_full is not None:
+                        gh, gw = h // genmatter_rt.STRIDE, w // genmatter_rt.STRIDE
+                        self._sam_grid_rgb = cv2.resize(
+                            self._sam_rgb_full, (gw, gh), interpolation=cv2.INTER_NEAREST)
+                    else:
+                        self._sam_grid_rgb = None
                 positions, velocities = genmatter_rt.unproject(
                     depth_np, flow_np, self._indices, self.intrinsics,
                     genmatter_rt.STRIDE)
@@ -526,7 +551,8 @@ class MatterWorker(threading.Thread):
                         self._pca_std,
                         stride=genmatter_rt.STRIDE,
                         image_hw=depth_np.shape,
-                        target_dim=genmatter_rt.FEATURE_DIM)
+                        target_dim=genmatter_rt.FEATURE_DIM,
+                        feat_grid_hw=ftsn.payload["grid_hw"])
 
                 with GPU:
                     if self._state is None:
@@ -538,6 +564,8 @@ class MatterWorker(threading.Thread):
                             yaml_cfg=self.yaml_cfg,
                             num_blobs=self._num_blobs,
                             num_hyperblobs=self._num_hyperblobs,
+                            sam_segmentation=self._sam_grid_rgb,
+                            subsample_indices=self._indices,
                             verbose=True)
                         # Pay the per-step JIT cost up front so steady-state
                         # latency below is honest.
@@ -1043,7 +1071,8 @@ def _warm_threadpool_controller():
 
 
 def main(out_path="assets/streaming_demo.mp4", duration=10.0, fps=30,
-         uncapped_source=False, source_fps=30, config_path=None):
+         uncapped_source=False, source_fps=30, config_path=None,
+         sam_frame0_path=None):
     _warm_threadpool_controller()
     slots = {k: Slot(name=k) for k in ["rgb","depth","flow","features","matter"]}
 
@@ -1055,7 +1084,8 @@ def main(out_path="assets/streaming_demo.mp4", duration=10.0, fps=30,
                          throttle_fps=src_throttle, resize=RESIZE)
     matter_worker = MatterWorker(slots["depth"], slots["flow"], slots["features"],
                                   slots["rgb"], slots["matter"],
-                                  config_path=config_path)
+                                  config_path=config_path,
+                                  sam_frame0_path=sam_frame0_path)
     workers = [
         source,
         DepthWorker(slots["rgb"], slots["depth"]),
@@ -1136,7 +1166,14 @@ if __name__ == "__main__":
                    help="YAML hyperparameter config for MatterWorker "
                         "(default: configs/streaming_default.yaml; pass "
                         "configs/streaming_tuned.yaml to use bayesopt output).")
+    p.add_argument("--sam-frame0", default="",
+                   help="Cached SAM-frame-0 mask for semantic init (opt-in; only "
+                        "used when tracking.use_sam_frame0 is also set). OFF by "
+                        "default: the live demo's slow init lands on a late/looped "
+                        "frame, so a frame-0 mask would be spatially misaligned. "
+                        "Pass e.g. assets/custom_videos/test/SAM_frame0/"
+                        "test_SAM_frame0.png to experiment.")
     args = p.parse_args()
     main(out_path=args.out, duration=args.duration, fps=args.fps,
          uncapped_source=args.uncapped_source, source_fps=args.source_fps,
-         config_path=args.config)
+         config_path=args.config, sam_frame0_path=args.sam_frame0 or None)

@@ -50,7 +50,10 @@ from jax.random import key as jkey
 from genmatter.datatypes import *  # noqa: F401,F403 — load first for circular import
 from genmatter.model_3d import *   # noqa: F401,F403 — see VENDORED.md circular-import note
 from genmatter.inference import *  # noqa: F401,F403
-from genmatter.utils import make_hierarchical_kmeans_chm_with_mask_fixed_hyperblob
+from genmatter.utils import (
+    make_hierarchical_kmeans_chm_with_mask_fixed_hyperblob,
+    make_hierarchical_kmeans_chm_with_SAM_segmentations,
+)
 
 from genmatter.tracking.dino import (
     GenMatter_Hyperparams_DINO,
@@ -58,6 +61,8 @@ from genmatter.tracking.dino import (
     blob_tracking_gibbs_dino,
     init_gibbs_sweep_dino,
     model_jimportance,  # pre-jitted GenMatter_model_dino.importance
+    estimate_feature_sigmas_from_chm,
+    FEATURE_SIGMA_FLOOR,
 )
 
 from genjax import ChoiceMapBuilder as _C
@@ -97,7 +102,10 @@ def _build_palette(n: int = NUM_BLOBS, seed: int = 0) -> np.ndarray:
 
 
 BLOB_PALETTE = _build_palette(NUM_BLOBS, seed=0)
-HYPERBLOB_PALETTE = _build_palette(max(NUM_HYPERBLOBS, 8), seed=42)
+# Sized generously (not just NUM_HYPERBLOBS=4) so the SAM-frame-0 semantic-init
+# path — which yields one hyperblob per SAM instance plus k-means hyperblobs for
+# unsegmented regions, typically 15-40 total — still renders distinct colors.
+HYPERBLOB_PALETTE = _build_palette(max(NUM_HYPERBLOBS, 64), seed=42)
 
 
 # ---------------- Geometry ----------------
@@ -175,15 +183,22 @@ def unproject(depth_hxw: np.ndarray, flow_2xhxw: np.ndarray,
 
 # ---------------- DINO features ----------------
 
-def _upsample_features_to_grid(feat: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
-    """feat: (P, D) flat DINO patches (P = gh_p * gw_p, e.g. 16*16=256).  We
-    reshape to (gh_p, gw_p, D), then resize each channel to (target_h,
-    target_w) via cv2.INTER_LINEAR.  cv2.resize handles multichannel only up
-    to 4; for arbitrary D we batch over channels.
+def _upsample_features_to_grid(feat: np.ndarray, target_h: int, target_w: int,
+                                grid_hw: Optional[Tuple[int, int]] = None) -> np.ndarray:
+    """feat: (P, D) flat DINO patches (P = gh_p * gw_p).  We reshape to
+    (gh_p, gw_p, D), then resize each channel to (target_h, target_w) via
+    cv2.INTER_LINEAR.  cv2.resize handles multichannel only up to 4; for
+    arbitrary D we batch over channels.
+
+    grid_hw : (gh_p, gw_p) patch grid.  Pass the FeatureWorker's grid_hw for a
+    non-square (dense) DINO grid; if None, assume a square grid (back-compat).
     """
     n = feat.shape[0]
-    gh_p = gw_p = int(round(np.sqrt(n)))
-    assert gh_p * gw_p == n, f"non-square patch grid {gh_p}x{gw_p} from {n}"
+    if grid_hw is not None:
+        gh_p, gw_p = int(grid_hw[0]), int(grid_hw[1])
+    else:
+        gh_p = gw_p = int(round(np.sqrt(n)))
+    assert gh_p * gw_p == n, f"patch grid {gh_p}x{gw_p} != {n} patches"
     D = feat.shape[1]
     g = feat.reshape(gh_p, gw_p, D).astype(np.float32)
     # cv2.resize processes up to 4 channels per call; iterate in blocks of 4.
@@ -202,6 +217,7 @@ def dino_features_to_datapoints(feat: np.ndarray, indices: np.ndarray,
                                  stride: int = STRIDE,
                                  image_hw: Tuple[int, int] = (360, 640),
                                  target_dim: int = FEATURE_DIM,
+                                 feat_grid_hw: Optional[Tuple[int, int]] = None,
                                  ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Upsample DINO patches to the 80x45 subsampled grid, gather at
     `indices`, then project through a frozen (or freshly-fit) PCA basis and
@@ -224,7 +240,7 @@ def dino_features_to_datapoints(feat: np.ndarray, indices: np.ndarray,
     """
     H, W = image_hw
     gh, gw = H // stride, W // stride
-    up = _upsample_features_to_grid(feat, gh, gw)        # (gh, gw, D_dino)
+    up = _upsample_features_to_grid(feat, gh, gw, grid_hw=feat_grid_hw)  # (gh, gw, D_dino)
     flat = up.reshape(gh * gw, -1)                        # (gh*gw, D_dino)
     sub = flat[indices]                                   # (N, D_dino)
     if pca_basis is None:
@@ -272,19 +288,39 @@ def _build_hypers(kmeans_chm, features_np, yaml_cfg, *, num_blobs, num_hyperblob
     empirical_Psi_B = jnp.median(kmeans_chm['blobs', 'blob_covs'][roi_blob_indices], axis=0)
     empirical_Psi_H = jnp.median(kmeans_chm['hyperblobs', 'hyperblob_covs'][roi_hyperblob_indices], axis=0)
     empirical_Psi_V = jnp.median(kmeans_chm['blobs', 'blob_vel_covs'][roi_blob_indices], axis=0)
+    # max(.,1) guards the SAM-init path, where many small hyperblobs/blobs can
+    # drive the per-group mean below 1 (int -> 0 -> degenerate inverse-Wishart).
+    # For the default k-means init these are ~16 / ~45, so the floor is inert.
     mean_blobs_per_hyperblob = num_blobs / max(num_hyperblobs, 1)
-    empirical_nu_H = f_(int(mean_blobs_per_hyperblob))  # noqa: F405 — f_ from datatypes
+    empirical_nu_H = f_(max(int(mean_blobs_per_hyperblob), 1))  # noqa: F405 — f_ from datatypes
     mean_points_per_blob = num_datapoints / max(num_blobs, 1)
-    empirical_nu_B = empirical_nu_V = f_(int(mean_points_per_blob))  # noqa: F405
+    empirical_nu_B = empirical_nu_V = f_(max(int(mean_points_per_blob), 1))  # noqa: F405
 
     gaussian_means = features_np.mean(0).astype(np.float32)
     gaussian_stds = features_np.std(0).astype(np.float32) + 1e-3
 
     hp = yaml_cfg["tracking"]["hyperparams"]
+    # Step 2 — empirical-Bayes feature variances: when calibrate_feature_sigmas
+    # is set, override the YAML sigma_F / sigma_F_H (the "sigma_F~9 too loose"
+    # bug) with the within-partition feature variance estimated directly from the
+    # k-means seed.  Same seam that already empirical-Bayes-fits the geometry
+    # priors above; native JAX, runs once at init.
+    if yaml_cfg["tracking"].get("calibrate_feature_sigmas", False):
+        sigma_F_est, sigma_F_H_est = estimate_feature_sigmas_from_chm(kmeans_chm, num_hyperblobs)
+        sigma_F_value = f_(float(jnp.maximum(sigma_F_est, FEATURE_SIGMA_FLOOR)))  # noqa: F405
+        sigma_F_H_value = f_(float(jnp.maximum(sigma_F_H_est, FEATURE_SIGMA_FLOOR)))  # noqa: F405
+        print(f"[genmatter_rt._build_hypers] calibrate_feature_sigmas: "
+              f"sigma_F {float(hp['sigma_F']):.4g} -> {float(sigma_F_value):.4g}, "
+              f"sigma_F_H {float(hp.get('sigma_F_H', 2.0)):.4g} -> {float(sigma_F_H_value):.4g}",
+              flush=True)
+    else:
+        sigma_F_value = f_(float(hp["sigma_F"]))  # noqa: F405
+        sigma_F_H_value = f_(float(hp.get("sigma_F_H", 2.0)))  # noqa: F405
     return GenMatter_Hyperparams_DINO.create(
         mu_F=jnp.array(gaussian_means),
         sigma_F_prior=jnp.array(gaussian_stds),
-        sigma_F=f_(float(hp["sigma_F"])),  # noqa: F405
+        sigma_F=sigma_F_value,
+        sigma_F_H=sigma_F_H_value,
         outlier_prob=f_(float(hp["outlier_prob"])),  # noqa: F405
         outlier_velocity_gamma_shape=f_(float(hp["outlier_velocity_gamma_shape"])),  # noqa: F405
         outlier_velocity_gamma_rate=f_(float(hp["outlier_velocity_gamma_rate"])),  # noqa: F405
@@ -315,10 +351,26 @@ def _build_hypers(kmeans_chm, features_np, yaml_cfg, *, num_blobs, num_hyperblob
 def init_state(positions: np.ndarray, velocities: np.ndarray, features: np.ndarray,
                 key, *, yaml_cfg: Optional[dict] = None,
                 num_blobs: int = NUM_BLOBS, num_hyperblobs: int = NUM_HYPERBLOBS,
-                num_warmup_sweeps: Optional[int] = None, verbose: bool = False):
+                num_warmup_sweeps: Optional[int] = None, verbose: bool = False,
+                sam_segmentation: Optional[np.ndarray] = None,
+                subsample_indices: Optional[np.ndarray] = None):
     """Bootstrap the GenMatter_State_DINO on the first valid (depth, flow,
     features) tuple.  Runs K-means + ``num_warmup_sweeps`` Gibbs iterations
-    (the slow startup, dominated by JIT compile of the Gibbs sweep)."""
+    (the slow startup, dominated by JIT compile of the Gibbs sweep).
+
+    SAM-anchored semantic init (Step 3): when ``tracking.use_sam_frame0`` is set
+    and a frame-0 SAM mask is supplied, each SAM instance seeds its own
+    hyperblob (and unsegmented regions get k-means hyperblobs) via
+    ``make_hierarchical_kmeans_chm_with_SAM_segmentations`` instead of the flat
+    position-only k-means — so streaming clusters START semantic.  ``num_blobs``
+    / ``num_hyperblobs`` then follow the SAM partition (the returned state's
+    actual counts), not the YAML values.
+
+    ``sam_segmentation`` must be the RGB pseudo-color SAM mask already
+    downsampled to the stride-8 grid that ``subsample_indices`` indexes into
+    (i.e. shape ``(H//stride, W//stride, 3)``), so the per-datapoint instance
+    labels line up with ``positions``/``velocities``.
+    """
     def _log(msg):
         if verbose:
             print(f"[genmatter_rt.init_state +{_t.monotonic() - _t_start:.1f}s] {msg}", flush=True)
@@ -331,45 +383,68 @@ def init_state(positions: np.ndarray, velocities: np.ndarray, features: np.ndarr
     if num_warmup_sweeps is None:
         num_warmup_sweeps = int(tracking_cfg.get("init_gibbs_sweeps", 15))
     N = positions.shape[0]
-    # All datapoints are ROI; pass num_roi_hyperblobs == num_hyperblobs so all
-    # hyperblob slots get blob assignments — initialize_model_with_dino doesn't
-    # expose num_roi_hyperblobs, so call the lower-level helper directly and
-    # then overlay the DINO feature stats (mirrors run_davis_tracking.py:324-336).
-    seg_mask = np.ones(N, dtype=bool)
     tracked_points = positions[None, ...]                       # (1, N, 3)
     tracked_motion_vectors = velocities[None, ...]              # (1, N, 3)
 
-    _log("entering K-means hierarchical init")
-    kmeans_chm, _roi_b, _roi_h = make_hierarchical_kmeans_chm_with_mask_fixed_hyperblob(
-        tracked_points,
-        num_blobs,
-        num_hyperblobs,
-        segmentation_mask=seg_mask,
-        motion_vectors=tracked_motion_vectors,
-        num_roi_blobs=None,
-        subsampled_indices=None,
-        num_roi_hyperblobs=num_hyperblobs,
-    )
-    _log("K-means done; building hypers + ChoiceMap overlays")
+    use_sam = (bool(tracking_cfg.get("use_sam_frame0", False))
+               and sam_segmentation is not None and subsample_indices is not None)
+    if use_sam:
+        sam_h, sam_w = sam_segmentation.shape[:2]
+        _log(f"entering SAM-frame-0 hierarchical init ({sam_h}x{sam_w} mask)")
+        kmeans_chm, _roi_b, _roi_h, num_hyperblobs = make_hierarchical_kmeans_chm_with_SAM_segmentations(
+            tracked_points,
+            num_blobs,
+            np.asarray(sam_segmentation),
+            (sam_h, sam_w),
+            subsampled_indices=np.asarray(subsample_indices),
+            motion_vectors=tracked_motion_vectors,
+        )
+        _log(f"SAM init done ({num_hyperblobs} hyperblobs); building hypers + overlays")
+    else:
+        # All datapoints are ROI; pass num_roi_hyperblobs == num_hyperblobs so all
+        # hyperblob slots get blob assignments — initialize_model_with_dino doesn't
+        # expose num_roi_hyperblobs, so call the lower-level helper directly and
+        # then overlay the DINO feature stats (mirrors run_davis_tracking.py:324-336).
+        seg_mask = np.ones(N, dtype=bool)
+        _log("entering K-means hierarchical init")
+        kmeans_chm, _roi_b, _roi_h = make_hierarchical_kmeans_chm_with_mask_fixed_hyperblob(
+            tracked_points,
+            num_blobs,
+            num_hyperblobs,
+            segmentation_mask=seg_mask,
+            motion_vectors=tracked_motion_vectors,
+            num_roi_blobs=None,
+            subsampled_indices=None,
+            num_roi_hyperblobs=num_hyperblobs,
+        )
+        _log("K-means done; building hypers + ChoiceMap overlays")
 
     # Overlay DINO features into the choice map (per-blob feature mean +
     # per-datapoint features) — same pattern as initialize_model_with_dino.
+    # Size blob_features to the chm's actual blob-slot count (blob_means rows),
+    # which the SAM-init partition sets dynamically; unpopulated slots stay zero.
     frame_features = features
     blob_assignments_np = np.array(kmeans_chm['datapoints', 'blob_assignments'])
-    num_blobs_actual_init = len(np.unique(blob_assignments_np))
     feature_dim = frame_features.shape[1]
-    blob_features = np.zeros((num_blobs_actual_init, feature_dim), dtype=np.float32)
-    for i in range(num_blobs_actual_init):
+    num_blob_slots = int(np.asarray(kmeans_chm['blobs', 'blob_means']).shape[0])
+    blob_features = np.zeros((num_blob_slots, feature_dim), dtype=np.float32)
+    for i in range(num_blob_slots):
         points_in_blob = np.where(blob_assignments_np == i)[0]
         if len(points_in_blob) > 0:
             blob_features[i] = np.mean(frame_features[points_in_blob], axis=0)
-    # Pad blob_features to match the full num_blobs slot count (K-means may
-    # return fewer unique labels than `num_blobs` if some clusters collapsed).
-    if num_blobs_actual_init < num_blobs:
-        pad = np.zeros((num_blobs - num_blobs_actual_init, feature_dim), dtype=np.float32)
-        blob_features = np.concatenate([blob_features, pad], axis=0)
     kmeans_chm = kmeans_chm | _C['datapoints', 'datapoint_features'].set(jnp.array(frame_features))
     kmeans_chm = kmeans_chm | _C['blobs', 'blob_features'].set(jnp.array(blob_features))
+    # Per-hyperblob feature means: vectorized segment-mean of blob_features by the
+    # k-means blob->hyperblob assignments (no python loop), so the DINO model's
+    # 'hyperblob_features' address is constrained at init for feature-aware clusters.
+    hb_assign_init = np.asarray(kmeans_chm['blobs', 'hyperblob_assignments']).astype(np.int64)
+    num_hb_init = int(np.asarray(kmeans_chm['hyperblobs', 'hyperblob_means']).shape[0])
+    hb_sums = np.zeros((num_hb_init, feature_dim), dtype=np.float32)
+    hb_counts = np.zeros((num_hb_init, 1), dtype=np.float32)
+    np.add.at(hb_sums, hb_assign_init, blob_features)
+    np.add.at(hb_counts, hb_assign_init, 1.0)
+    hyperblob_features = hb_sums / np.maximum(hb_counts, 1.0)
+    kmeans_chm = kmeans_chm | _C['hyperblobs', 'hyperblob_features'].set(jnp.array(hyperblob_features))
 
     num_datapoints = kmeans_chm['datapoints', 'datapoint_positions'].shape[0]
     num_blobs_actual = kmeans_chm['blobs', 'hyperblob_assignments'].shape[0]
@@ -574,6 +649,46 @@ def hyperblob_palette_per_blob(state) -> np.ndarray:
     return HYPERBLOB_PALETTE[np.clip(hb, 0, HYPERBLOB_PALETTE.shape[0] - 1)]
 
 
+def _nn_fill_grid(grid: np.ndarray) -> np.ndarray:
+    """Fill the ``< 0`` (unknown) cells of an int ``(gh, gw)`` grid with the
+    value of their nearest known cell, via cv2's labelled distance transform.
+    All-unknown grids fall back to zeros."""
+    unknown = (grid < 0)
+    if not unknown.any():
+        return grid
+    if (~unknown).sum() == 0:
+        return np.zeros_like(grid)
+    # cv2.distanceTransformWithLabels: pass a mask where the unknown cells are
+    # 255 (positive) and known cells are 0.  It returns, for each cell, the
+    # 1-based ordinal label of the nearest 0-cell in raster-scan order over the
+    # known cells.
+    known_mask = (~unknown).astype(np.uint8) * 255
+    _, labels = cv2.distanceTransformWithLabels(
+        255 - known_mask, cv2.DIST_L2, 3, labelType=cv2.DIST_LABEL_PIXEL
+    )
+    known_vals = grid[~unknown]
+    out = grid.copy()
+    out[unknown] = known_vals[labels[unknown] - 1]
+    return out
+
+
+def labels_to_filled_grid(labels: np.ndarray, indices: np.ndarray,
+                          gh: int, gw: int, drop_outliers: bool = True) -> np.ndarray:
+    """Sparse -> dense label adapter (shares ``render_matter_tile``'s NN-fill).
+
+    Scatter per-datapoint integer ``labels`` (``-1`` = outlier) onto the
+    ``(gh, gw)`` grid at ``indices``, then NN-fill the unset / outlier cells
+    from the nearest non-outlier neighbour.  Returns an int ``(gh, gw)`` label
+    grid (labels, not BGR) so the debug harness can score it against reference
+    grids without re-deriving the fill.
+    """
+    grid = np.full((gh * gw,), -1, dtype=np.int32)
+    lab = np.asarray(labels)
+    keep = (lab >= 0) if drop_outliers else np.ones(lab.shape[0], dtype=bool)
+    grid[np.asarray(indices)[keep]] = lab[keep].astype(np.int32)
+    return _nn_fill_grid(grid.reshape(gh, gw))
+
+
 def render_matter_tile(blob_assignments: np.ndarray,
                         hyperblob_per_dp: np.ndarray,
                         indices: np.ndarray,
@@ -626,29 +741,8 @@ def render_matter_tile(blob_assignments: np.ndarray,
     hyper_grid = hyper_grid.reshape(gh, gw)
     outlier_grid = outlier_grid.reshape(gh, gw)
 
-    def _fill(grid):
-        unknown = (grid < 0)
-        if not unknown.any():
-            return grid
-        if (~unknown).sum() == 0:
-            # Edge case: all cells unknown (e.g. every datapoint is an
-            # outlier).  Fall back to a neutral color so the tile renders.
-            return np.zeros_like(grid)
-        # cv2.distanceTransformWithLabels: pass a mask where the unknown
-        # cells are 255 (positive) and known cells are 0.  It then returns,
-        # for each cell, the 1-based ordinal label of the nearest 0-cell in
-        # the order they appear in a raster scan over the known cells.
-        known_mask = (~unknown).astype(np.uint8) * 255
-        _, labels = cv2.distanceTransformWithLabels(
-            255 - known_mask, cv2.DIST_L2, 3, labelType=cv2.DIST_LABEL_PIXEL
-        )
-        known_vals = grid[~unknown]
-        out = grid.copy()
-        out[unknown] = known_vals[labels[unknown] - 1]
-        return out
-
-    blob_grid = _fill(blob_grid)
-    hyper_grid = _fill(hyper_grid)
+    blob_grid = _nn_fill_grid(blob_grid)
+    hyper_grid = _nn_fill_grid(hyper_grid)
 
     blob_full = cv2.resize(blob_grid.astype(np.int32), (w, h),
                             interpolation=cv2.INTER_NEAREST)
