@@ -1,0 +1,177 @@
+# StreamingVision: self-supervised, structure-aware calibrated hypers.
+# Produced by scripts/calibrate_consistency.py. ONE GLOBAL config; NO
+# per-video knobs; NO test-set tuning.
+#
+# Methodology: hypers LEARNED + the global scalar tuple SELECTED entirely
+# self-supervised on a TRAIN split (region-J of the CLUSTER foreground vs
+# cached SAM Z_sam>0). Real DAVIS GT was read ONCE, on a disjoint HELD-OUT
+# split, as the generalization gate only. Two-level approximate inference:
+# per-frame Bayesian filtering with 1 Gibbs sweeps + a 5-sweep
+# warmup (the deep E-step that de-biases the conjugate M-step), outer
+# SAEM (α=0.3 damping, numerical-stability veto, per-group accept-test on
+# an 8-video crossval subset OF TRAIN: cluster / particle / motion).
+#
+# Inference strategy (ONE global config — these ship alongside the hypers):
+#   use_sam_frame0    = True  (SAM2 frame-0 semantic init)
+#   num_blobs         = 128
+#   num_hyperblobs    = 4  (k-means fallback; SAM init sets it dynamically)
+#   init_gibbs_sweeps = 5
+#   per-frame sweeps  = 1  (calibration depth; live demo runs 1)
+# EM iterations run: 6
+# Best-iteration median self-supervised region-J (TRAIN) = 0.8549
+#
+# Chosen scalar values:
+#   sigma_F      = 0.2858
+#   sigma_F_H    = 1.5222
+#   sigma_V      = 2.349e-02
+#   outlier_prob = 5.000
+#   gamma_shape  = 5.000
+#   gamma_rate   = 1.000
+#   alpha        = 1.879
+#   beta         = 1.044
+#   sigma_H      = 25.000
+#   nu_B / nu_H / nu_V = 48.0 / 12.2 / 42.4
+#   translation_max_radius     = 0.5871
+#   translation_gaussian_scale = 0.1446
+#   use_calibrated_priors      = True
+#
+# HELD-OUT validation (chosen = this config; baseline = previously-shipping):
+#   real DAVIS GT region-J: chosen 0.5769 vs baseline 0.6514 (median Δ over 14 held-out DAVIS = +0.0172)  <- GENERALIZATION GATE
+#   self-supervised SAM region-J (held-out): chosen 0.7897 (median Δ matter-J = -0.0013)
+#   chosen max outlier_frac p95 (held-out) = 0.0000
+#   gate passed (median Δ GT region-J > 0 AND max p95 ≤ baseline + 0.05): True
+#   self-supervised objective = region_J; corr(composite, GT) spearman = -0.007 (kill-switch OK = True)
+#   sigma_V (velocity anchor) = 2.349e-02  (streaming_default.yaml keeps 1e14 → live path bit-exact)
+paths:
+  custom_videos_root: assets/custom_videos
+  deeplearning_weights_dir: assets/deeplearning_weights
+  video_depth_anything_path: null
+preprocess:
+  pipeline:
+    skip_existing: true
+    force: false
+  frames:
+    max_len: -1
+    target_fps: -1
+    skip_frames: 1
+    max_res: 1280
+    jpg_quality: 95
+    frame_name_pattern: '{:05d}.jpg'
+  motion_3d:
+    encoder: vits
+    input_size: 392
+    max_res: 480
+    max_len: -1
+    target_fps: -1
+    fp32: false
+    device: cuda
+    skip_frames: 1
+    subsample: 1.0
+  dino:
+    target_h: 520
+    target_w: 960
+    patch_size: 14
+    n_components: 10
+    device: cuda
+  sam_frame0:
+    model: sam2.1_l.pt
+    min_threshold: 0.15
+    seed: 42
+    frame_name: 00000.jpg
+pseudo_gt:
+  model: sam2.1_l.pt
+  min_threshold: 0.15
+  iou_threshold: 0.3
+  prefer_video: true
+  video_imgsz: 1024
+  max_objects: 12
+  video_chunk_frames: 16
+  detect_new_objects: true
+tracking:
+  pipeline:
+    skip_existing: false
+    force: false
+  measure_fps: true
+  num_blobs: 128
+  num_hyperblobs: 4
+  datapoint_retain_pct: 81.25
+  random_seed: 42
+  focal_length: 520.0
+  use_sam_frame0: true
+  init_gibbs_sweeps: 5
+  tracking_outlier_prob: 1.0e-28
+  dense_disable_outlier_prob: false
+  calibrate_feature_sigmas: false
+  blob_counting_threshold: 0
+  hyperparams:
+    sigma_F: 0.28584102521489324
+    sigma_F_H: 1.5222373642149012
+    outlier_prob: 5.0
+    outlier_velocity_gamma_shape: 5.0
+    outlier_velocity_gamma_rate: 1.0
+    alpha: 1.8794247949120648
+    beta: 1.0442138325763841
+    sigma_H: 25.0
+    sigma_V: 0.023490388685806683
+    translation_gaussian_scale: 0.14464779017493126
+    translation_max_radius: 0.5870999691486353
+    translation_num_radii_cells: 15
+    translation_theta_step_deg: 15
+    rotation_vmf_kappa: 100.0
+    rotation_angle_max_deg: 25.0
+    rotation_angle_step_deg: 0.375
+    Psi_B:
+    - - 0.14582917094230652
+      - -0.0002466569421812892
+      - -0.002620100509375334
+    - - -0.0002466570003889501
+      - 0.027310790494084358
+      - -0.020097333937883377
+    - - -0.002620100509375334
+      - -0.020097337663173676
+      - 0.06425511837005615
+    Psi_H:
+    - - 0.8911169171333313
+      - 0.006660568993538618
+      - -0.013411789201200008
+    - - 0.006660568993538618
+      - 0.7361724376678467
+      - -0.041567809879779816
+    - - -0.013411789201200008
+      - -0.041567809879779816
+      - 0.7772526144981384
+    Psi_V:
+    - - 0.0016560039948672056
+      - 5.6025015510385856e-05
+      - 0.00017114885849878192
+    - - 5.6025015510385856e-05
+      - 0.0011802290100604296
+      - -0.0003764917782973498
+    - - 0.000171148800291121
+      - -0.0003764917782973498
+      - 0.006733808666467667
+    nu_B: 48.0
+    nu_H: 12.25
+    nu_V: 42.449999999999996
+    mu_H:
+    - 0.037244975566864014
+    - -0.04550579562783241
+    - 2.4974987506866455
+  feature_aware_final_assignment: true
+  final_assignment_outlier: false
+  freeze_hyperblob_assignment: true
+  pure_object_seed: true
+  blob_means_updates_per_frame: 15
+  use_calibrated_priors: true
+viz:
+  pipeline:
+    skip_existing: false
+    force: false
+  point_radius: 0.015
+  flow_arrow_scale: 1.0
+  ellipsoid_sigma_scale: 1.0
+  feature_pca_seed: 42
+  include_assignment_colors: true
+  include_hyperblob_assignment_colors: true
+  include_flow: true
+  include_depth: true
