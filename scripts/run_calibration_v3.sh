@@ -52,6 +52,16 @@ SELECT_SIGMA_V="${SELECT_SIGMA_V:-}"
 OBJECTIVE="${OBJECTIVE:-composite}"
 EXTRA_ARGS=( --objective "$OBJECTIVE" )
 [ -n "$SELECT_SIGMA_V" ] && EXTRA_ARGS+=( --select-sigma-v "$SELECT_SIGMA_V" )
+# Phase-A anti-drift damping + Phase-B probabilistic-objective knobs.
+#   SELECT_FEATURE_UPDATE_DAMPING=0.0,0.25,0.5,1.0  -> SELECT the damping self-sup on TRAIN
+#   FEATURE_UPDATE_DAMPING=0.25                      -> pin the em/validate damping (skip select axis)
+#   DATA_LOGLIK_VARIANT=full|pos_feat|feat_only      -> which loglik term drives selection
+SELECT_FUD="${SELECT_FEATURE_UPDATE_DAMPING:-}"
+FUD="${FEATURE_UPDATE_DAMPING:-}"
+LL_VARIANT="${DATA_LOGLIK_VARIANT:-}"
+[ -n "$SELECT_FUD" ] && EXTRA_ARGS+=( --select-feature-update-damping "$SELECT_FUD" )
+[ -n "$FUD" ] && EXTRA_ARGS+=( --feature-update-damping "$FUD" )
+[ -n "$LL_VARIANT" ] && EXTRA_ARGS+=( --data-loglik-variant "$LL_VARIANT" )
 
 mkdir -p "$RUN_DIR"
 
@@ -69,6 +79,25 @@ done
 echo "[run_v3 $(ts)] PHASE preflight"
 $PY scripts/calibrate_consistency.py --phase preflight "${EXTRA_ARGS[@]}" "$@" || {
   echo "[run_v3 $(ts)] preflight FAILED — aborting"; exit 1; }
+
+# --- OPTIONAL cheap GATES (RUN_GATES=1): the Phase-A damping pvc sweep + the
+#     Phase-B data_loglik GT-correlation proto. Abort the run if the probabilistic
+#     objective does NOT positively correlate with held-out GT (decision #2: the
+#     gate is the pre-run guard against a degenerate objective). Default 0 because
+#     these are normally run by hand once before kicking off the full sweep. ---
+if [ "${RUN_GATES:-0}" = "1" ]; then
+  echo "[run_v3 $(ts)] PHASE gate-A (pvc damping sweep, heldout)"
+  $PY scripts/pvc_loop.py --set heldout \
+      --candidates tracker:premotion tracker:freeze_all_drift \
+      tracker:damp0.0_drift tracker:damp0.25_drift tracker:damp0.5_drift || {
+    echo "[run_v3 $(ts)] gate-A FAILED — aborting"; exit 1; }
+  if [ "$OBJECTIVE" = "data_loglik" ]; then
+    echo "[run_v3 $(ts)] PHASE gate-B (data_loglik GT-correlation proto, heldout)"
+    $PY scripts/_loglik_objective_proto.py --set heldout || {
+      echo "[run_v3 $(ts)] gate-B FAILED: data_loglik does NOT track GT — abort; "
+      echo "               revert OBJECTIVE=composite or iterate the loglik formulation"; exit 1; }
+  fi
+fi
 
 # --- OPTIONAL Phase E: regenerate higher-quality SAM2 pseudo-labels, then the
 #     cheap Z_sam/Z_dino refresh (no perception recompute). Gated + reversible:

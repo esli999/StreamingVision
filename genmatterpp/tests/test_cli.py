@@ -110,25 +110,3 @@ def test_main_viz_success(mock_load, mock_run, minimal_config_yaml, tmp_path) ->
     )
     assert code == 0
     mock_run.assert_called_once()
-
-
-@patch("genmatter.custom.bayesopt_cmd.run_bayesopt")
-def test_main_bayesopt_passes_tracking_set(mock_run, minimal_config_yaml) -> None:
-    code = main(
-        [
-            "bayesopt",
-            "--video-id",
-            "clip",
-            "--config",
-            str(minimal_config_yaml),
-            "--set",
-            "tracking.num_blobs=1",
-            "--bo-set",
-            "phase.phase_a_sobol_evals=2",
-        ]
-    )
-    assert code == 0
-    mock_run.assert_called_once()
-    _, kwargs = mock_run.call_args
-    assert kwargs["tracking_set"] == ["tracking.num_blobs=1"]
-    assert kwargs["bayesopt_set"] == ["phase.phase_a_sobol_evals=2"]

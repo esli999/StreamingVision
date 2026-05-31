@@ -39,20 +39,21 @@ if sg:
     combos = sg.get("combos", [])
     grid = sg.get("grid", {})
     total = 1
-    for ax in ("num_blobs","init_gibbs_sweeps","num_gibbs_sweeps_per_frame","sigma_V","blob_means_updates"):
+    for ax in ("num_blobs","init_gibbs_sweeps","num_gibbs_sweeps_per_frame","sigma_V","blob_means_updates","feature_update_damping"):
         total *= max(len(grid.get(ax,[])), 1)
     print(f"[select] {len(combos)}/{total or '?'} combos scored (objective={sg.get('objective_mode','composite')})")
     for c in sorted(combos, key=lambda c: -(_g(c,'select_val_score','select_val_region_J') or -9)):
         print(f"         nb{c['combo'][0]:>3} igs{c['combo'][1]:>2} sw{c['combo'][2]} "
-              f"sv{float(_ci(c,3,0.1)):.0e} bmu{_ci(c,4,15)} -> "
-              f"comp {_g(c,'select_val_score','select_val_region_J'):.4f} "
+              f"sv{float(_ci(c,3,0.1)):.0e} bmu{_ci(c,4,15)} fud{_ci(c,5,1.0)} -> "
+              f"obj {_g(c,'select_val_score','select_val_region_J'):.4f} "
               f"(rJ {c.get('select_val_region_J',float('nan')):.4f} p95 {c.get('select_val_median_p95',float('nan')):.4f})")
 sel = load("selected_infer.json")
 if sel:
     print(f"[selected] num_blobs={sel.get('num_blobs')} init_gibbs_sweeps={sel.get('init_gibbs_sweeps')} "
           f"per_frame_sweeps={sel.get('num_gibbs_sweeps_per_frame')} "
           f"sigma_V_seed={sel.get('sigma_V_seed','?')} bmu={sel.get('blob_means_updates','?')} "
-          f"(SELECT_VAL composite {_g(sel,'select_val_score','select_val_region_J'):.4f})")
+          f"damping={sel.get('feature_update_damping','?')} "
+          f"(SELECT_VAL obj {_g(sel,'select_val_score','select_val_region_J'):.4f})")
 em = load("em.json")
 iters = sorted(glob.glob(os.path.join(rd, "em_iter_*.json")))
 if em or iters:
@@ -64,12 +65,15 @@ if em or iters:
 val = load("validate.json")
 if val:
     cgt = val.get("composite_gt_corr", {})
+    lgt = val.get("data_loglik_gt_corr", {})
     print(f"[validate] median Δ GT region-J = {val.get('median_delta_gt_J',float('nan')):+.4f} "
           f"(chosen {val.get('chosen_median_gt_J_davis',float('nan')):.4f} vs baseline "
           f"{val.get('baseline_median_gt_J_davis',float('nan')):.4f}) | GATE "
-          f"{'PASS' if val.get('passed') else 'FAIL'} | corr(comp,GT) spearman="
-          f"{cgt.get('spearman',float('nan')):.2f} (ok={val.get('composite_kill_switch_ok',True)}) "
-          f"| baseline={val.get('baseline_source','?')}")
+          f"{'PASS' if val.get('passed') else 'FAIL'} | baseline={val.get('baseline_source','?')}")
+    print(f"[validate] kill-switch: objective={val.get('objective_mode','composite')} "
+          f"corr(data_loglik,GT) spearman={lgt.get('spearman',float('nan')):.2f}/"
+          f"pearson={lgt.get('pearson',float('nan')):.2f} (loglik_ok={val.get('loglik_kill_switch_ok',True)}) "
+          f"| corr(composite,GT) spearman={cgt.get('spearman',float('nan')):.2f}")
 PY
   if [ -f "$LOG" ]; then
     echo "----- tail run_v3.log -----"

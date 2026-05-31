@@ -49,10 +49,6 @@ def resolve_video_paths(cfg: CustomConfig, video_id: str) -> VideoPaths:
     )
 
 
-def bayesopt_run_dir(paths: VideoPaths, run_id: str) -> Path:
-    return paths.video_root / "bayesopt" / run_id
-
-
 def ensure_video_dirs(paths: VideoPaths) -> None:
     paths.rgb_frames_dir.mkdir(parents=True, exist_ok=True)
     paths.npz_path.parent.mkdir(parents=True, exist_ok=True)

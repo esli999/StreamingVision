@@ -17,9 +17,10 @@ Calibration to 640x360 test.mp4
   * Random subsample 2925 of them (= 3 * Gibbs internal batch_size 975).
   * num_blobs = 64, num_hyperblobs = 4 (configurable via YAML).
   * Intrinsics + per-blob hyperparameters loaded from
-    ``configs/streaming_default.yaml`` (or ``streaming_tuned.yaml`` after
-    bayesopt).  ``sigma_F`` defaults to 2.0 (the realtime-demo branch's
-    setting; lower values produced an outlier-dominated visualization).
+    ``configs/streaming_default.yaml`` (or ``streaming_general.yaml`` once
+    the multi-video calibrator has produced it).  ``sigma_F`` defaults to
+    2.0 (the realtime-demo branch's setting; lower values produced an
+    outlier-dominated visualization).
   * Depth model returns relative inverse depth; we min/max-normalize per
     frame and invert to a pseudo-Z in roughly [0.83, 5.0] m.
   * DINO PCA: fit a 384 -> 32 basis on the first frame's per-pixel features
@@ -31,6 +32,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -53,6 +55,7 @@ from genmatter.inference import *  # noqa: F401,F403
 from genmatter.utils import (
     make_hierarchical_kmeans_chm_with_mask_fixed_hyperblob,
     make_hierarchical_kmeans_chm_with_SAM_segmentations,
+    sample_covariance_matrix_numpy,
 )
 
 from genmatter.tracking.dino import (
@@ -63,6 +66,22 @@ from genmatter.tracking.dino import (
     model_jimportance,  # pre-jitted GenMatter_model_dino.importance
     estimate_feature_sigmas_from_chm,
     FEATURE_SIGMA_FLOOR,
+    # Module-level Gibbs building blocks (re-exported into dino's namespace via
+    # `from genmatter.inference import *`).  Imported here so the streaming-local
+    # sweep override below can replicate dino.blob_tracking_gibbs_dino's schedule
+    # without editing the vendored file (VENDORED.md: no edits to genmatterpp/).
+    gibbs_blob_assignments_dino,
+    gibbs_blob_weights,
+    gibbs_blob_means,
+    gibbs_blob_features_dino,
+    gibbs_blob_vel_means,
+    gibbs_blob_vel_covs,
+    gibbs_hyperblob_assignments_dino,
+    gibbs_hyperblob_means,
+    gibbs_hyperblob_covs,
+    gibbs_hyperblob_rot,
+    gibbs_hyperblob_trans,
+    gibbs_hyperblob_features_dino,
 )
 
 from genjax import ChoiceMapBuilder as _C
@@ -101,11 +120,87 @@ def _build_palette(n: int = NUM_BLOBS, seed: int = 0) -> np.ndarray:
     return bgr
 
 
-BLOB_PALETTE = _build_palette(NUM_BLOBS, seed=0)
+# Sized to the larger calibrated blob budget (128) so the matter-tile renders
+# distinct colors for every blob under the stronger inference strategy; the live
+# demo at NUM_BLOBS=64 just uses the first 64 entries. render_matter_tile reads
+# the length dynamically, so this is safe to enlarge.
+BLOB_PALETTE = _build_palette(max(NUM_BLOBS, 128), seed=0)
 # Sized generously (not just NUM_HYPERBLOBS=4) so the SAM-frame-0 semantic-init
 # path — which yields one hyperblob per SAM instance plus k-means hyperblobs for
 # unsegmented regions, typically 15-40 total — still renders distinct colors.
 HYPERBLOB_PALETTE = _build_palette(max(NUM_HYPERBLOBS, 64), seed=42)
+# Hyperblob 0 is NOT background under the semantic-seed init: when
+# make_hierarchical_kmeans_chm_with_SAM_segmentations seeds clusters it assigns
+# the segmented OBJECT instances first (hyperblob_idx 0, 1, ...) and the
+# background k-means hyperblobs AFTER them, so id 0 is typically the primary
+# tracked object (the car / first judoka). The earlier muted-gray override here
+# was tied to the GT-propagation cluster hack (since removed), where id 0 meant
+# the bg sentinel — under the real frozen-hyperblob view it would paint the
+# tracked object gray and bury it in the background, so we give id 0 a vivid,
+# saturated color instead (so the seeded object visually pops).
+HYPERBLOB_PALETTE[0] = np.array([60, 220, 60], dtype=np.uint8)   # vivid green (BGR)
+
+
+def _build_vivid_fg_colors(n: int) -> np.ndarray:
+    """``n`` maximally-distinct VIVID/saturated BGR colors for the foreground
+    (seeded-object) hyperblobs in the CLUSTER tiles.
+
+    Hue is spread on the golden-ratio sequence (so even a handful of instances
+    land far apart on the wheel) at full saturation/value, so each tracked
+    object reads as a punchy, high-chroma color that pops against the muted
+    background. Id 0 is pinned to the established vivid green so the primary
+    tracked object keeps its identity across the prior renders.
+    """
+    if n <= 0:
+        return np.empty((0, 3), dtype=np.uint8)
+    # Golden-angle hue walk in OpenCV's 0..179 hue space, max S/V.
+    hues = (np.arange(n) * (179.0 * 0.61803398875)) % 180.0
+    hsv = np.zeros((n, 1, 3), dtype=np.uint8)
+    hsv[:, 0, 0] = hues.astype(np.uint8)
+    hsv[:, 0, 1] = 255
+    hsv[:, 0, 2] = 255
+    bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR).reshape(n, 3)
+    bgr[0] = (60, 220, 60)                           # keep the canonical vivid green for id 0
+    return bgr
+
+
+def _build_muted_bg_colors(n: int, seed: int = 42) -> np.ndarray:
+    """``n`` DESATURATED, low-contrast muted BGR tones for the background
+    (k-means) hyperblobs in the CLUSTER tiles.
+
+    Low saturation + mid-low value keeps the many background clusters legible
+    as distinct regions WITHOUT competing with the vivid foreground — they read
+    as a quiet palette of grays / earth tones so the eye snaps to the object.
+    """
+    if n <= 0:
+        return np.empty((0, 3), dtype=np.uint8)
+    rng = np.random.default_rng(seed)
+    hsv = np.zeros((n, 1, 3), dtype=np.uint8)
+    hsv[:, 0, 0] = rng.integers(0, 180, n).astype(np.uint8)      # any hue ...
+    hsv[:, 0, 1] = rng.integers(18, 55, n).astype(np.uint8)      # ... but barely saturated
+    hsv[:, 0, 2] = rng.integers(95, 165, n).astype(np.uint8)     # mid-low value (muted)
+    return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR).reshape(n, 3)
+
+
+def build_cluster_palette(num_fg: int, n_total: int = None) -> np.ndarray:
+    """CLUSTER-tile palette: VIVID foreground (ids ``< num_fg``) + MUTED
+    background (ids ``>= num_fg``), so the seeded object POPS against a
+    desaturated background.
+
+    ``num_fg`` is the number of seeded OBJECT-instance hyperblobs — under
+    ``make_hierarchical_kmeans_chm_with_SAM_segmentations`` these are exactly
+    the low ids ``0 .. num_fg-1`` (the segmented instances are assigned first,
+    background k-means hyperblobs after). Sized to ``n_total`` (defaults to the
+    rainbow ``HYPERBLOB_PALETTE`` length) so the ``palette[label]`` lookup in
+    ``render_matter_tile`` never indexes out of range.
+    """
+    if n_total is None:
+        n_total = HYPERBLOB_PALETTE.shape[0]
+    num_fg = int(max(0, min(num_fg, n_total)))
+    pal = np.empty((n_total, 3), dtype=np.uint8)
+    pal[:num_fg] = _build_vivid_fg_colors(num_fg)
+    pal[num_fg:] = _build_muted_bg_colors(n_total - num_fg)
+    return pal
 
 
 # ---------------- Geometry ----------------
@@ -275,12 +370,18 @@ def load_yaml_hypers(config_path: Optional[Path] = None) -> dict:
 
 
 def _build_hypers(kmeans_chm, features_np, yaml_cfg, *, num_blobs, num_hyperblobs,
-                   num_datapoints):
+                   num_datapoints, debug_capture: Optional[dict] = None):
     """Derive Psi_* from the K-means cluster covs (empirical), then layer the
     YAML-driven hyperparameters on top.  Mirrors the branch's
     `_build_hypers_from_kmeans` (`genmatter/tracking/dino.py:957`) but reads
-    its scalar priors from our streaming YAML so bayesopt-tuned values can be
-    consumed directly."""
+    its scalar priors from our streaming YAML so calibrated values can be
+    consumed directly.
+
+    When ``tracking.use_calibrated_priors`` is true, reads ``Psi_B/H/V``,
+    ``nu_B/H/V``, ``mu_H`` from ``tracking.hyperparams`` (the calibrator's
+    output) instead of deriving them from the K-means seed.  Plumbing for the
+    self-supervised calibrator (see plan
+    `~/.claude/plans/piped-discovering-pebble.md`)."""
     roi_blob_indices = jnp.arange(num_blobs)
     roi_hyperblob_indices = jnp.arange(num_hyperblobs)
 
@@ -300,6 +401,34 @@ def _build_hypers(kmeans_chm, features_np, yaml_cfg, *, num_blobs, num_hyperblob
     gaussian_stds = features_np.std(0).astype(np.float32) + 1e-3
 
     hp = yaml_cfg["tracking"]["hyperparams"]
+    use_calibrated = bool(yaml_cfg["tracking"].get("use_calibrated_priors", False))
+    if use_calibrated:
+        mu_H_value = jnp.asarray(hp["mu_H"], dtype=jnp.float32)
+        Psi_B_value = jnp.asarray(hp["Psi_B"], dtype=jnp.float32)
+        Psi_H_value = jnp.asarray(hp["Psi_H"], dtype=jnp.float32)
+        Psi_V_value = jnp.asarray(hp["Psi_V"], dtype=jnp.float32)
+        nu_B_value = f_(float(hp["nu_B"]))  # noqa: F405
+        nu_H_value = f_(float(hp["nu_H"]))  # noqa: F405
+        nu_V_value = f_(float(hp["nu_V"]))  # noqa: F405
+    else:
+        mu_H_value = empirical_mu_H
+        Psi_B_value = empirical_Psi_B
+        Psi_H_value = empirical_Psi_H
+        Psi_V_value = empirical_Psi_V
+        nu_B_value = empirical_nu_B
+        nu_H_value = empirical_nu_H
+        nu_V_value = empirical_nu_V
+    if debug_capture is not None:
+        # Exposes the K-means-derived values to the calibrator's plumbing
+        # smoke test so it can emit a streaming_general_smoke.yaml that
+        # round-trips byte-for-byte through the use_calibrated_priors path.
+        debug_capture["empirical_mu_H"] = np.asarray(empirical_mu_H, dtype=np.float32)
+        debug_capture["empirical_Psi_B"] = np.asarray(empirical_Psi_B, dtype=np.float32)
+        debug_capture["empirical_Psi_H"] = np.asarray(empirical_Psi_H, dtype=np.float32)
+        debug_capture["empirical_Psi_V"] = np.asarray(empirical_Psi_V, dtype=np.float32)
+        debug_capture["empirical_nu_B"] = float(empirical_nu_B)
+        debug_capture["empirical_nu_H"] = float(empirical_nu_H)
+        debug_capture["empirical_nu_V"] = float(empirical_nu_V)
     # Step 2 — empirical-Bayes feature variances: when calibrate_feature_sigmas
     # is set, override the YAML sigma_F / sigma_F_H (the "sigma_F~9 too loose"
     # bug) with the within-partition feature variance estimated directly from the
@@ -326,15 +455,15 @@ def _build_hypers(kmeans_chm, features_np, yaml_cfg, *, num_blobs, num_hyperblob
         outlier_velocity_gamma_rate=f_(float(hp["outlier_velocity_gamma_rate"])),  # noqa: F405
         alpha=f_(float(hp["alpha"])),  # noqa: F405
         beta=f_(float(hp["beta"])),  # noqa: F405
-        mu_H=empirical_mu_H,
+        mu_H=mu_H_value,
         sigma_H=f_(float(hp["sigma_H"])),  # noqa: F405
-        nu_H=empirical_nu_H,
-        Psi_H=empirical_Psi_H,
-        nu_B=empirical_nu_B,
-        Psi_B=empirical_Psi_B,
+        nu_H=nu_H_value,
+        Psi_H=Psi_H_value,
+        nu_B=nu_B_value,
+        Psi_B=Psi_B_value,
         sigma_V=f_(float(hp["sigma_V"])),  # noqa: F405
-        nu_V=empirical_nu_V,
-        Psi_V=empirical_Psi_V,
+        nu_V=nu_V_value,
+        Psi_V=Psi_V_value,
         translation_gaussian_scale=snp(f_(float(hp["translation_gaussian_scale"]))),  # noqa: F405
         translation_max_radius=snp(float(hp["translation_max_radius"])),  # noqa: F405
         translation_num_radii_cells=snp(int(hp["translation_num_radii_cells"])),  # noqa: F405
@@ -348,12 +477,160 @@ def _build_hypers(kmeans_chm, features_np, yaml_cfg, *, num_blobs, num_hyperblob
     )
 
 
+def instance_mask_to_rgb_grid(mask_native: np.ndarray, grid_h: int,
+                              grid_w: int) -> np.ndarray:
+    """Convert a native-resolution uint16 SAM2 instance-id map into the
+    ``(grid_h, grid_w, 3)`` RGB pseudo-color mask that ``init_state``'s
+    SAM-frame-0 branch (and ``make_hierarchical_kmeans_chm_with_SAM_segmentations``)
+    expect: instance id 0 -> background white ``[255, 255, 255]``; each non-zero
+    id -> a distinct color.
+
+    The downstream SAM helper only cares that (a) background is exactly white and
+    (b) every distinct instance id maps to a distinct non-white color (it calls
+    ``np.unique`` over the colors and assigns sequential labels).  We therefore
+    encode the integer id *bijectively* into the three channels
+    (b = id & 255, g = (id >> 8) & 255, r = (id >> 16) & 255), which is
+    collision-free across the entire uint16 id range — SAM2 ids reach the
+    hundreds, so a fixed-size palette would alias distinct instances onto a single
+    hyperblob.  No non-zero uint16 id can encode to pure white (that needs
+    id == 0xFFFFFF), so the background sentinel stays unambiguous.
+
+    Resize is INTER_NEAREST so ids are never interpolated into nonexistent
+    colors — mirrors the live demo's downsample (render_demo.py:552) but starts
+    from an id-map instead of an RGB PNG.
+    """
+    mask = np.asarray(mask_native)
+    if mask.ndim == 3:
+        mask = mask[..., 0]
+    small = cv2.resize(mask.astype(np.int32), (grid_w, grid_h),
+                       interpolation=cv2.INTER_NEAREST).astype(np.int64)
+    ids = np.clip(small, 0, None)
+    rgb = np.empty((grid_h, grid_w, 3), dtype=np.uint8)
+    rgb[..., 0] = (ids & 0xFF).astype(np.uint8)
+    rgb[..., 1] = ((ids >> 8) & 0xFF).astype(np.uint8)
+    rgb[..., 2] = ((ids >> 16) & 0xFF).astype(np.uint8)
+    rgb[ids == 0] = (255, 255, 255)             # background sentinel
+    return rgb
+
+
+def _seed_grid_to_datapoint_instance_ids(sam_segmentation: np.ndarray,
+                                          subsample_indices: np.ndarray) -> Tuple[np.ndarray, int]:
+    """Map the ``(gh, gw, 3)`` RGB seed grid to a per-datapoint integer instance
+    id, byte-identical to ``make_hierarchical_kmeans_chm_with_SAM_segmentations``'s
+    own color->label assignment (background white ``[255,255,255]`` -> 0; every
+    other distinct color -> sequential 1..K in ``np.unique`` order).  Returns
+    ``(instance_ids_N, num_object_instances)``.
+    """
+    flat = np.asarray(sam_segmentation).reshape(-1, 3)
+    unique_colors = np.unique(flat, axis=0)
+    color_to_label = {}
+    label = 0
+    for color in unique_colors:
+        if np.array_equal(color, [255, 255, 255]):
+            color_to_label[tuple(int(c) for c in color)] = 0
+        else:
+            label += 1
+            color_to_label[tuple(int(c) for c in color)] = label
+    integer_mask_full = np.array(
+        [color_to_label[tuple(int(c) for c in px)] for px in flat], dtype=np.int64)
+    inst_ids = integer_mask_full[np.asarray(subsample_indices)]
+    return inst_ids, int(label)
+
+
+def _purify_object_seed_chm(kmeans_chm, sam_segmentation: np.ndarray,
+                            subsample_indices: np.ndarray):
+    """Seed-purity fix (``tracking.pure_object_seed``): rebuild the blob ->
+    hyperblob assignment so each OBJECT-instance hyperblob contains EXACTLY the
+    blobs whose frame-0 datapoints are majority-inside that instance's mask, and
+    all other blobs are pushed into BACKGROUND hyperblobs (the background is NOT
+    collapsed — its existing multi-hyperblob split is preserved).
+
+    Host-side CHM construction at init (not in the per-frame hot loop), so a plain
+    numpy rebuild is fine.  The object-instance hyperblob ids stay the LOW ids
+    ``0..num_object_instances-1`` (matching the SAM builder's convention that the
+    vivid-fg cluster palette + ``freeze_hyperblob_assignment`` rely on); only the
+    blob->hyperblob membership (and the derived per-hyperblob geometry/feature
+    arrays) is rewritten.  The frozen membership is therefore the PURIFIED one.
+
+    No-op-equivalent when the seed grid already partitions blobs cleanly (the
+    common GT-seeded case, where the CHM is already pure); meaningful when the
+    seed instances are noisy (SAM) so a blob's datapoints straddle instance
+    boundaries.
+    """
+    inst_ids, num_obj = _seed_grid_to_datapoint_instance_ids(
+        sam_segmentation, subsample_indices)            # (N,), int
+
+    blob_assign = np.asarray(kmeans_chm['datapoints', 'blob_assignments']).astype(np.int64)
+    blob_to_hb_old = np.asarray(kmeans_chm['blobs', 'hyperblob_assignments']).astype(np.int64)
+    num_blobs = int(blob_to_hb_old.shape[0])
+    num_hb_old = int(np.asarray(kmeans_chm['hyperblobs', 'hyperblob_means']).shape[0])
+
+    # Per-blob majority instance id (0 = background) over its frame-0 datapoints.
+    blob_majority_inst = np.zeros(num_blobs, dtype=np.int64)
+    for b in range(num_blobs):
+        m = (blob_assign == b)
+        if m.any():
+            vals = inst_ids[m]
+            counts = np.bincount(vals, minlength=num_obj + 1)
+            blob_majority_inst[b] = int(np.argmax(counts))
+
+    # New blob->hyperblob map: object instance j -> hyperblob (j-1) (low ids);
+    # every other (background) blob keeps its OLD hyperblob, shifted up by num_obj
+    # so background ids never collide with the object ids.  This preserves the
+    # background's existing multi-hyperblob split (no collapse).
+    blob_to_hb_new = np.empty(num_blobs, dtype=np.int64)
+    is_obj_blob = blob_majority_inst > 0
+    blob_to_hb_new[is_obj_blob] = blob_majority_inst[is_obj_blob] - 1
+    blob_to_hb_new[~is_obj_blob] = num_obj + blob_to_hb_old[~is_obj_blob]
+
+    # Compact the realized hyperblob ids to a contiguous 0..K-1 range, keeping the
+    # object ids first (so vivid-fg palette + num_fg accounting stay correct).
+    used = np.unique(blob_to_hb_new)
+    remap = {int(old): new for new, old in enumerate(used)}
+    blob_to_hb_new = np.array([remap[int(h)] for h in blob_to_hb_new], dtype=np.int64)
+    num_hb_new = int(len(used))
+
+    # Rebuild per-hyperblob geometry from the member blobs' datapoints (means/covs
+    # /weights) and the member blobs' velocities (rot=I, trans=mean vel) — the
+    # same statistics the SAM builder computes, now over the purified partition.
+    positions = np.asarray(kmeans_chm['datapoints', 'datapoint_positions'])
+    vels = np.asarray(kmeans_chm['datapoints', 'datapoint_vels'])
+    total_points = positions.shape[0]
+    hb_means = np.zeros((num_hb_new, 3), dtype=np.float32)
+    hb_covs = np.tile(np.eye(3, dtype=np.float32) * 0.01, (num_hb_new, 1, 1))
+    hb_weights = np.zeros((num_hb_new,), dtype=np.float32)
+    hb_rot = np.tile(np.eye(3, dtype=np.float32), (num_hb_new, 1, 1))
+    hb_trans = np.zeros((num_hb_new, 3), dtype=np.float32)
+    dp_hb = blob_to_hb_new[blob_assign]                 # per-datapoint new hyperblob
+    global_mean = positions.mean(axis=0)
+    for h in range(num_hb_new):
+        pts = positions[dp_hb == h]
+        if pts.shape[0] > 0:
+            hb_means[h] = pts.mean(axis=0)
+            hb_weights[h] = pts.shape[0] / total_points
+            if pts.shape[0] > 3:
+                hb_covs[h] = sample_covariance_matrix_numpy(pts).astype(np.float32)
+            hb_trans[h] = vels[dp_hb == h].mean(axis=0)
+        else:
+            hb_means[h] = global_mean
+
+    chm = kmeans_chm
+    chm = chm | _C['blobs', 'hyperblob_assignments'].set(jnp.array(blob_to_hb_new))
+    chm = chm | _C['hyperblobs', 'hyperblob_means'].set(jnp.array(hb_means))
+    chm = chm | _C['hyperblobs', 'hyperblob_covs'].set(jnp.array(hb_covs))
+    chm = chm | _C['hyperblobs', 'hyperblob_weights'].set(jnp.array(hb_weights))
+    chm = chm | _C['hyperblobs', 'hyperblob_rot_vels'].set(jnp.array(hb_rot))
+    chm = chm | _C['hyperblobs', 'hyperblob_trans_vels'].set(jnp.array(hb_trans))
+    return chm, num_hb_new
+
+
 def init_state(positions: np.ndarray, velocities: np.ndarray, features: np.ndarray,
                 key, *, yaml_cfg: Optional[dict] = None,
                 num_blobs: int = NUM_BLOBS, num_hyperblobs: int = NUM_HYPERBLOBS,
                 num_warmup_sweeps: Optional[int] = None, verbose: bool = False,
                 sam_segmentation: Optional[np.ndarray] = None,
-                subsample_indices: Optional[np.ndarray] = None):
+                subsample_indices: Optional[np.ndarray] = None,
+                debug_capture: Optional[dict] = None):
     """Bootstrap the GenMatter_State_DINO on the first valid (depth, flow,
     features) tuple.  Runs K-means + ``num_warmup_sweeps`` Gibbs iterations
     (the slow startup, dominated by JIT compile of the Gibbs sweep).
@@ -400,6 +677,16 @@ def init_state(positions: np.ndarray, velocities: np.ndarray, features: np.ndarr
             motion_vectors=tracked_motion_vectors,
         )
         _log(f"SAM init done ({num_hyperblobs} hyperblobs); building hypers + overlays")
+        # Seed-purity fix (default OFF -> bit-exact to the prior path).  Rewrite
+        # the blob->hyperblob membership so each object-instance hyperblob holds
+        # EXACTLY the blobs majority-inside that instance and all other blobs go
+        # to (still-multiple) background hyperblobs.  Host-side CHM rebuild at
+        # init (not the per-frame loop); the purified membership is what
+        # freeze_hyperblob_assignment then freezes.
+        if bool(tracking_cfg.get("pure_object_seed", False)):
+            kmeans_chm, num_hyperblobs = _purify_object_seed_chm(
+                kmeans_chm, np.asarray(sam_segmentation), np.asarray(subsample_indices))
+            _log(f"pure_object_seed: purified CHM -> {num_hyperblobs} hyperblobs")
     else:
         # All datapoints are ROI; pass num_roi_hyperblobs == num_hyperblobs so all
         # hyperblob slots get blob assignments — initialize_model_with_dino doesn't
@@ -453,7 +740,8 @@ def init_state(positions: np.ndarray, velocities: np.ndarray, features: np.ndarr
     hypers = _build_hypers(kmeans_chm, features, yaml_cfg,
                             num_blobs=num_blobs_actual,
                             num_hyperblobs=num_hb_actual,
-                            num_datapoints=num_datapoints)
+                            num_datapoints=num_datapoints,
+                            debug_capture=debug_capture)
 
     _log("running model_jimportance (first JIT compile of model)")
     key, k_imp = jax.random.split(key)
@@ -477,8 +765,268 @@ def init_state(positions: np.ndarray, velocities: np.ndarray, features: np.ndarr
     return state, key
 
 
-@jax.jit
-def _step_jit(key, state, positions, velocities, features):
+def blob_tracking_gibbs_dino_streaming(key, genmatter_state, *,
+                                       feature_aware_final: bool,
+                                       final_outlier: bool,
+                                       freeze_hyperblob_assignment: bool = False,
+                                       blob_means_updates: int = 15,
+                                       freeze_blob_features: bool = False,
+                                       feature_update_damping=None,
+                                       blob_feat_anchor=None,
+                                       hb_feat_anchor=None):
+    """Streaming-local re-implementation of
+    ``genmatter.tracking.dino.blob_tracking_gibbs_dino`` (dino.py:743-832) whose
+    FINAL assignment step (the dino.py:826 ``update_blob_assignments_with_outlier``
+    step) is configurable, so we can ablate it WITHOUT editing the vendored file.
+
+    The vendored schedule ends its assignment phase with a POSITION-ONLY +
+    outlier-injecting assignment, so the labels the renderer reads are
+    position-driven (DINO features washed out) with outliers added as the last
+    word — the suspected cause of "per-pixel CLUSTER view worse than the raw
+    DINO PCA, too many outliers".
+
+    Flags (closed over as Python bools at build time -> NOT jax-traced, so the
+    static ``fori_loop`` counts and the choice of final-step body are baked into
+    one compiled program; never forces a mid-run recompile):
+
+      feature_aware_final=False  (baseline)  : final step is IDENTICAL to dino.py
+          -> gibbs_blob_assignments_dino(position_only=True,
+                                         disable_outlier_prob=False) + weights.
+          Reproduces current streaming behavior bit-for-bit.
+
+      feature_aware_final=True   (fix)       : final step is a FULL position +
+          feature (+ velocity, since neither position_only nor velocity_only nor
+          feature_only is set) likelihood assignment
+          -> gibbs_blob_assignments_dino(position_only=False, feature_only=False,
+                                         disable_outlier_prob=(not final_outlier))
+             + weights.
+          ``final_outlier`` toggles whether outliers are enabled on that step.
+
+    Everything else (3x hyperblob, 2x feature-only assign, 1x position-only
+    assign, 15x means, 3x features, then 15x vel-means, 15x vel-covs, 3x
+    features, 3x hyperblob) is byte-identical to dino.py:818-830.
+
+    ``freeze_hyperblob_assignment`` (Python bool, build-time) — when True the
+    per-frame ``hyperblob_update_loop`` SKIPS the blob->hyperblob membership
+    re-sampling (``gibbs_hyperblob_assignments_dino``, dino.py:804) while KEEPING
+    the geometry/appearance updates (means/covs/rot/trans/features_dino).  This
+    makes cluster identity sticky: the frame-0 seeded blob->hyperblob mapping is
+    preserved across the stream so the ``pixel_by_cluster`` view tracks the same
+    object instead of re-partitioning into coarse spatial clusters every frame.
+    Default False reproduces the vendored behavior bit-for-bit.
+
+    ``blob_means_updates`` (Python int, build-time) — number of
+    ``gibbs_blob_means`` refinement iterations per frame (the dino.py:824
+    ``fori_loop(0, 15, update_blob_means, ...)``).  Each iteration re-solves the
+    blob-mean posterior, which blends the constant-velocity PREDICTION
+    (``next_blob_means``, the prior carried in via the hyperblob mean + velocity
+    affine terms) against the DATA term ``blob_cov_inv * N_l * S_l`` — so MORE
+    iterations let a frozen object blob's mean be pulled further toward whatever
+    datapoints currently fall in it (including background that leaked in, since
+    DINO appearance is shared near the object).  FEWER iterations keep the mean
+    nearer the velocity prediction (anti-drift; approximates a stronger
+    velocity-anchored prior — lever 2 — without editing the vendored
+    ``gibbs_blob_means``).  CONVERGE-round anti-bleed lever: default 15
+    reproduces dino.py/the vendored schedule bit-for-bit.
+
+    ``feature_update_damping`` / ``blob_feat_anchor`` / ``hb_feat_anchor``
+    (anti-drift, DAMPED generalization of ``freeze_blob_features``) — when
+    ``blob_feat_anchor`` is supplied (TRACED arrays, NOT static), every per-frame
+    Gibbs feature update is followed by a blend back toward the frame-0 anchor:
+    ``f = (1 - d)*anchor + d*f_gibbs`` with ``d = feature_update_damping`` (a
+    TRACED jnp scalar in [0, 1]).  d=1 reproduces the vendored pure-Gibbs update;
+    d=0 holds the frame-0 appearance frozen (== ``freeze_blob_features``); d in
+    (0, 1) is a slow-EMA that lets a deforming object's appearance follow while
+    resisting runaway drift into leaked background.  Because the anchor and the
+    damping are TRACED args, ONE compiled program serves every damping value and
+    every video of equal shape (no per-value / per-video recompile).  When
+    ``blob_feat_anchor is None`` (the default) NONE of this runs and the existing
+    vendored / ``freeze_blob_features`` static paths are byte-identical.
+    """
+    # Build-time (Python, NOT traced) branch: blend only when an anchor is given.
+    _blend = blob_feat_anchor is not None
+
+    def update_blob_assignments_position_only(i, carry):
+        key, st = carry
+        key, gibbs_key = jax.random.split(key)
+        st = gibbs_blob_assignments_dino(
+            gibbs_key, st, position_only=True, disable_outlier_prob=True
+        )
+        key, gibbs_key = jax.random.split(key)
+        st = gibbs_blob_weights(gibbs_key, st)
+        return key, st
+
+    def update_blob_assignments_feature_only(i, carry):
+        key, st = carry
+        key, gibbs_key = jax.random.split(key)
+        st = gibbs_blob_assignments_dino(
+            gibbs_key, st, feature_only=True, disable_outlier_prob=False
+        )
+        key, gibbs_key = jax.random.split(key)
+        st = gibbs_blob_weights(gibbs_key, st)
+        return key, st
+
+    def update_blob_assignments_final_baseline(i, carry):
+        # dino.py:755-763 update_blob_assignments_with_outlier: position-only,
+        # outliers ENABLED.  The vendored "last assignment word".
+        key, st = carry
+        key, gibbs_key = jax.random.split(key)
+        st = gibbs_blob_assignments_dino(
+            gibbs_key, st, position_only=True, disable_outlier_prob=False
+        )
+        key, gibbs_key = jax.random.split(key)
+        st = gibbs_blob_weights(gibbs_key, st)
+        return key, st
+
+    def update_blob_assignments_final_feature_aware(i, carry):
+        # Fix: FULL position+feature+velocity likelihood as the last assignment,
+        # so DINO features (and motion) drive the labels the renderer reads.
+        key, st = carry
+        key, gibbs_key = jax.random.split(key)
+        st = gibbs_blob_assignments_dino(
+            gibbs_key, st, position_only=False, feature_only=False,
+            disable_outlier_prob=(not final_outlier),
+        )
+        key, gibbs_key = jax.random.split(key)
+        st = gibbs_blob_weights(gibbs_key, st)
+        return key, st
+
+    def update_blob_velocities(i, carry):
+        key, st = carry
+        key, gibbs_key = jax.random.split(key)
+        st = gibbs_blob_vel_means(gibbs_key, st)
+        return key, st
+
+    def update_blob_velocity_covariances(i, carry):
+        key, st = carry
+        key, gibbs_key = jax.random.split(key)
+        st = gibbs_blob_vel_covs(gibbs_key, st)
+        return key, st
+
+    def update_blob_means(i, carry):
+        key, st = carry
+        key, gibbs_key = jax.random.split(key)
+        st = gibbs_blob_means(gibbs_key, st)
+        return key, st
+
+    def update_blob_features_dino(i, carry):
+        key, st = carry
+        key, gibbs_key = jax.random.split(key)
+        st = gibbs_blob_features_dino(gibbs_key, st)
+        if _blend:
+            # Damped appearance update: pull the freshly-Gibbs'd blob features
+            # back toward the frozen frame-0 anchor by (1 - damping).  d=1 ->
+            # pure Gibbs (vendored); d=0 -> frozen anchor.  Traced scalar/arrays,
+            # so no per-value / per-video recompile.
+            f_g = st.blobs_state.blob_features
+            f_b = ((1.0 - feature_update_damping) * blob_feat_anchor
+                   + feature_update_damping * f_g)
+            st = st.replace({'blobs_state': {'blob_features': f_b}})
+        return key, st
+
+    def hyperblob_update_loop(i, carry):
+        key, st = carry
+        # freeze_hyperblob_assignment is a Python bool closed over at build time
+        # (NOT jax-traced), so this branch is resolved once at compile: when True
+        # the per-frame blob->hyperblob membership re-sampling (dino.py:804) is
+        # SKIPPED, preserving the frame-0 (k-means / SAM / GT) seeded cluster
+        # identity, while the geometry/appearance updates below still let each
+        # cluster's mean/cov/rot/trans/feature follow its member blobs as they move.
+        if not freeze_hyperblob_assignment:
+            key, gibbs_key = jax.random.split(key)
+            st = gibbs_hyperblob_assignments_dino(gibbs_key, st)
+        key, gibbs_key = jax.random.split(key)
+        st = gibbs_hyperblob_means(gibbs_key, st)
+        key, gibbs_key = jax.random.split(key)
+        st = gibbs_hyperblob_covs(gibbs_key, st)
+        key, gibbs_key = jax.random.split(key)
+        st = gibbs_hyperblob_rot(gibbs_key, st)
+        key, gibbs_key = jax.random.split(key)
+        st = gibbs_hyperblob_trans(gibbs_key, st)
+        # freeze_blob_features (build-time bool): when True, the per-frame appearance
+        # (hyperblob feature mean) update is SKIPPED so the frame-0 seeded appearance
+        # is held FROZEN across the stream (mirrors the frozen-centroid feature
+        # classifier that beats the drifting tracker). Default False = bit-exact.
+        # When the DAMPED path is active (_blend) the update RUNS but is blended
+        # back toward the frame-0 hyperblob anchor (d=0 == freeze; d=1 == vendored).
+        if _blend:
+            key, gibbs_key = jax.random.split(key)
+            st = gibbs_hyperblob_features_dino(gibbs_key, st)
+            hf_g = st.hyperblobs_state.hyperblob_features
+            hf_b = ((1.0 - feature_update_damping) * hb_feat_anchor
+                    + feature_update_damping * hf_g)
+            st = st.replace({'hyperblobs_state': {'hyperblob_features': hf_b}})
+        elif not freeze_blob_features:
+            key, gibbs_key = jax.random.split(key)
+            st = gibbs_hyperblob_features_dino(gibbs_key, st)
+        return key, st
+
+    # Python-bool branch at BUILD time (not traced): pick the final-step body.
+    final_step = (update_blob_assignments_final_feature_aware
+                  if feature_aware_final
+                  else update_blob_assignments_final_baseline)
+
+    key, genmatter_state = jax.lax.fori_loop(0, 3, hyperblob_update_loop, (key, genmatter_state))
+    key, genmatter_state = jax.lax.fori_loop(0, 2, update_blob_assignments_feature_only, (key, genmatter_state))
+    key, genmatter_state = jax.lax.fori_loop(0, 1, update_blob_assignments_position_only, (key, genmatter_state))
+    # CONVERGE anti-bleed lever: blob_means_updates (default 15 = dino.py) sets how
+    # many times the blob-mean posterior is re-solved.  Python int closed over at
+    # build time -> static fori_loop bound (no recompile mid-run).
+    key, genmatter_state = jax.lax.fori_loop(0, blob_means_updates, update_blob_means, (key, genmatter_state))
+    # freeze_blob_features (build-time bool): 0 feature-mean updates => the blob
+    # appearance stays at its frame-0 init (anti-drift). Default 3 = vendored.
+    # The DAMPED path always runs the 3 updates (the blend toward the anchor,
+    # inside update_blob_features_dino, applies the damping continuously).
+    _feat_updates = 3 if (_blend or not freeze_blob_features) else 0
+    key, genmatter_state = jax.lax.fori_loop(0, _feat_updates, update_blob_features_dino, (key, genmatter_state))
+    key, genmatter_state = jax.lax.fori_loop(0, 1, final_step, (key, genmatter_state))
+    key, genmatter_state = jax.lax.fori_loop(0, 15, update_blob_velocities, (key, genmatter_state))
+    key, genmatter_state = jax.lax.fori_loop(0, 15, update_blob_velocity_covariances, (key, genmatter_state))
+    key, genmatter_state = jax.lax.fori_loop(0, _feat_updates, update_blob_features_dino, (key, genmatter_state))
+    key, genmatter_state = jax.lax.fori_loop(0, 3, hyperblob_update_loop, (key, genmatter_state))
+
+    return genmatter_state
+
+
+# Per-frame tracking-config flags controlling the FINAL Gibbs assignment step
+# (see ``blob_tracking_gibbs_dino_streaming``).  Set by ``init_state`` from the
+# YAML ``tracking`` block so ``_step_jit`` / the multi-sweep step (built before
+# the per-frame loop) close over the right Python bools.  Defaults reproduce the
+# vendored behavior exactly (feature_aware_final=False, final_outlier=True), so
+# any config that doesn't set these keys is unchanged.
+_FEATURE_AWARE_FINAL_DEFAULT = False
+_FINAL_OUTLIER_DEFAULT = True
+# When True the per-frame Gibbs SKIPS blob->hyperblob membership re-sampling
+# (dino.py:804), making cluster identity STICKY across frames (the frame-0
+# seeded blob->hyperblob mapping is preserved) while geometry/appearance still
+# follow the member blobs.  Default False preserves current behavior exactly.
+_FREEZE_HYPERBLOB_ASSIGNMENT_DEFAULT = False
+# Number of per-frame gibbs_blob_means refinements (the dino.py:824
+# fori_loop(0, 15, ...)).  Default 15 reproduces the vendored schedule exactly;
+# lowering it is the CONVERGE anti-bleed lever (keeps frozen object blob means
+# near the constant-velocity prediction instead of chasing leaked background
+# datapoints).  jit-static (closed over at build time).
+_BLOB_MEANS_UPDATES_DEFAULT = 15
+# When True the per-frame Gibbs SKIPS the blob/hyperblob DINO feature-mean updates
+# (gibbs_blob_features_dino / gibbs_hyperblob_features_dino), holding the frame-0
+# seeded APPEARANCE frozen across the stream. Motivation (pvc_loop, 2026-05-30): a
+# frozen-centroid feature classifier scores ~0.71 region-J while the drifting
+# tracker scores ~0.50 from the SAME seed — the per-frame appearance update drifts
+# the object representation into background. jit-static; default False = bit-exact.
+_FREEZE_BLOB_FEATURES_DEFAULT = False
+
+
+@partial(jax.jit, static_argnames=("feature_aware_final", "final_outlier",
+                                    "freeze_hyperblob_assignment",
+                                    "blob_means_updates", "freeze_blob_features"))
+def _step_jit(key, state, positions, velocities, features,
+              feature_aware_final: bool = _FEATURE_AWARE_FINAL_DEFAULT,
+              final_outlier: bool = _FINAL_OUTLIER_DEFAULT,
+              freeze_hyperblob_assignment: bool = _FREEZE_HYPERBLOB_ASSIGNMENT_DEFAULT,
+              blob_means_updates: int = _BLOB_MEANS_UPDATES_DEFAULT,
+              freeze_blob_features: bool = _FREEZE_BLOB_FEATURES_DEFAULT,
+              blob_feat_anchor=None, hb_feat_anchor=None,
+              feature_update_damping=None):
     """Body of `f_tracking_sweep` from run_davis_tracking.py:626-640, but
     standalone so we can call it per-frame instead of via lax.scan."""
     next_blob_means = state.blobs_state.blob_vel_means + state.blobs_state.blob_means
@@ -491,23 +1039,175 @@ def _step_jit(key, state, positions, velocities, features):
         }
     })
     key, gibbs_key = jax.random.split(key)
-    state = blob_tracking_gibbs_dino(gibbs_key, state)
+    state = blob_tracking_gibbs_dino_streaming(
+        gibbs_key, state,
+        feature_aware_final=feature_aware_final, final_outlier=final_outlier,
+        freeze_hyperblob_assignment=freeze_hyperblob_assignment,
+        blob_means_updates=blob_means_updates,
+        freeze_blob_features=freeze_blob_features,
+        feature_update_damping=feature_update_damping,
+        blob_feat_anchor=blob_feat_anchor,
+        hb_feat_anchor=hb_feat_anchor,
+    )
     return state, key
 
 
-def step(state, positions: np.ndarray, velocities: np.ndarray, features: np.ndarray, key):
-    """One Gibbs sweep on the current frame.  Returns (new_state, new_key)."""
+def step(state, positions: np.ndarray, velocities: np.ndarray, features: np.ndarray, key,
+         *, feature_aware_final: bool = _FEATURE_AWARE_FINAL_DEFAULT,
+         final_outlier: bool = _FINAL_OUTLIER_DEFAULT,
+         freeze_hyperblob_assignment: bool = _FREEZE_HYPERBLOB_ASSIGNMENT_DEFAULT,
+         blob_means_updates: int = _BLOB_MEANS_UPDATES_DEFAULT,
+         freeze_blob_features: bool = _FREEZE_BLOB_FEATURES_DEFAULT,
+         blob_feat_anchor=None, hb_feat_anchor=None,
+         feature_update_damping=None):
+    """One Gibbs sweep on the current frame.  Returns (new_state, new_key).
+
+    ``blob_feat_anchor``/``hb_feat_anchor``/``feature_update_damping`` (all
+    default None) activate the DAMPED anti-drift feature update (see
+    ``blob_tracking_gibbs_dino_streaming``); they are passed to ``_step_jit`` as
+    TRACED args (not static) so damping value + per-video anchor never recompile.
+    """
     pj = jnp.asarray(positions)
     vj = jnp.asarray(velocities)
     fj = jnp.asarray(features)
-    state, key = _step_jit(key, state, pj, vj, fj)
+    damp = None if feature_update_damping is None else jnp.asarray(
+        feature_update_damping, dtype=jnp.float32)
+    ba = None if blob_feat_anchor is None else jnp.asarray(blob_feat_anchor)
+    ha = None if hb_feat_anchor is None else jnp.asarray(hb_feat_anchor)
+    # Static (Python-bool/int) args -> _step_jit specializes one compile per combo.
+    state, key = _step_jit(key, state, pj, vj, fj,
+                           feature_aware_final=bool(feature_aware_final),
+                           final_outlier=bool(final_outlier),
+                           freeze_hyperblob_assignment=bool(freeze_hyperblob_assignment),
+                           blob_means_updates=int(blob_means_updates),
+                           freeze_blob_features=bool(freeze_blob_features),
+                           blob_feat_anchor=ba, hb_feat_anchor=ha,
+                           feature_update_damping=damp)
+    return state, key
+
+
+# ---- Multi-sweep per-frame step (calibration only; streaming demo uses step) ----
+#
+# Calibration deepens the per-frame measurement update (Level 1 of the two-level
+# inference in ~/.claude/plans/velvet-knitting-nova.md) from 1 Gibbs sweep to N:
+# predict + splice ONCE per frame, then ``jax.lax.scan`` blob_tracking_gibbs_dino
+# N times inside a single jit boundary.  Re-predicting inside the scan would
+# advance blob_means by N velocity steps (wrong dynamics), so the predict is
+# hoisted out — mirroring ``f_tracking_sweep_dino`` active_step (dino.py:889) and
+# ``_init_gibbs_scan_step`` (dino.py:849, whose scan body is also gibbs-only).
+_MULTI_SWEEP_CACHE: dict = {}
+
+
+def _make_multi_sweep_step(num_sweeps: int,
+                           feature_aware_final: bool = _FEATURE_AWARE_FINAL_DEFAULT,
+                           final_outlier: bool = _FINAL_OUTLIER_DEFAULT,
+                           freeze_hyperblob_assignment: bool = _FREEZE_HYPERBLOB_ASSIGNMENT_DEFAULT,
+                           blob_means_updates: int = _BLOB_MEANS_UPDATES_DEFAULT,
+                           freeze_blob_features: bool = _FREEZE_BLOB_FEATURES_DEFAULT):
+    """Build one jit'd N-sweep step; the caller caches it per distinct
+    ``(num_sweeps, feature_aware_final, final_outlier,
+    freeze_hyperblob_assignment, blob_means_updates)``.  All are closed over as
+    Python values (the scan length is static; the flags select the
+    final-assignment body, whether hyperblob membership is re-sampled, and the
+    per-frame blob-mean refinement count in
+    ``blob_tracking_gibbs_dino_streaming`` at build time), so they never force a
+    recompile mid-run."""
+    @jax.jit
+    def _multi_step(key, state, positions, velocities, features,
+                    blob_feat_anchor=None, hb_feat_anchor=None,
+                    feature_update_damping=None):
+        # Predict (constant-velocity dynamics) + splice the new frame ONCE.
+        next_blob_means = state.blobs_state.blob_vel_means + state.blobs_state.blob_means
+        state = state.replace({'blobs_state': {'blob_means': next_blob_means}})
+        state = state.replace({
+            'datapoints_state': {
+                'datapoint_positions': positions,
+                'datapoint_vels': velocities,
+                'datapoint_features': features,
+            }
+        })
+
+        def _sweep(carry, _):
+            key, state = carry
+            key, gibbs_key = jax.random.split(key)   # key threaded via carry
+            # blob_feat_anchor/hb_feat_anchor/feature_update_damping are TRACED
+            # runtime args (None when not damping) -> the anti-drift blend is
+            # baked once per (blend on/off) structure, not per damping value or
+            # per video.
+            state = blob_tracking_gibbs_dino_streaming(
+                gibbs_key, state,
+                feature_aware_final=feature_aware_final, final_outlier=final_outlier,
+                freeze_hyperblob_assignment=freeze_hyperblob_assignment,
+                blob_means_updates=blob_means_updates,
+                freeze_blob_features=freeze_blob_features,
+                feature_update_damping=feature_update_damping,
+                blob_feat_anchor=blob_feat_anchor,
+                hb_feat_anchor=hb_feat_anchor,
+            )
+            return (key, state), None
+
+        (key, state), _ = jax.lax.scan(_sweep, (key, state), None, length=num_sweeps)
+        return state, key
+    return _multi_step
+
+
+def step_multi_sweep(state, positions: np.ndarray, velocities: np.ndarray,
+                     features: np.ndarray, key, num_sweeps: int,
+                     *, feature_aware_final: bool = _FEATURE_AWARE_FINAL_DEFAULT,
+                     final_outlier: bool = _FINAL_OUTLIER_DEFAULT,
+                     freeze_hyperblob_assignment: bool = _FREEZE_HYPERBLOB_ASSIGNMENT_DEFAULT,
+                     blob_means_updates: int = _BLOB_MEANS_UPDATES_DEFAULT,
+                     freeze_blob_features: bool = _FREEZE_BLOB_FEATURES_DEFAULT,
+                     blob_feat_anchor=None, hb_feat_anchor=None,
+                     feature_update_damping=None):
+    """N-sweep variant of ``step()``.  Falls through to ``step()`` when
+    ``num_sweeps <= 1`` so the streaming code path pays no extra JIT compile or
+    scan-of-1 overhead.  Caches one compiled implementation per
+    ``(num_sweeps, feature_aware_final, final_outlier,
+    freeze_hyperblob_assignment, blob_means_updates, freeze_blob_features,
+    blend)``.  The damped-feature anchors / damping are TRACED runtime args (not
+    in the cache key beyond the blend on/off bit), so one program serves all
+    damping values and all videos of equal shape."""
+    if num_sweeps <= 1:
+        return step(state, positions, velocities, features, key,
+                    feature_aware_final=feature_aware_final,
+                    final_outlier=final_outlier,
+                    freeze_hyperblob_assignment=freeze_hyperblob_assignment,
+                    blob_means_updates=blob_means_updates,
+                    freeze_blob_features=freeze_blob_features,
+                    blob_feat_anchor=blob_feat_anchor,
+                    hb_feat_anchor=hb_feat_anchor,
+                    feature_update_damping=feature_update_damping)
+    pj = jnp.asarray(positions)
+    vj = jnp.asarray(velocities)
+    fj = jnp.asarray(features)
+    blend = blob_feat_anchor is not None
+    ba = None if blob_feat_anchor is None else jnp.asarray(blob_feat_anchor)
+    ha = None if hb_feat_anchor is None else jnp.asarray(hb_feat_anchor)
+    damp = None if feature_update_damping is None else jnp.asarray(
+        feature_update_damping, dtype=jnp.float32)
+    cache_key = (int(num_sweeps), bool(feature_aware_final), bool(final_outlier),
+                 bool(freeze_hyperblob_assignment), int(blob_means_updates),
+                 bool(freeze_blob_features), bool(blend))
+    fn = _MULTI_SWEEP_CACHE.get(cache_key)
+    if fn is None:
+        fn = _make_multi_sweep_step(num_sweeps, bool(feature_aware_final),
+                                    bool(final_outlier),
+                                    bool(freeze_hyperblob_assignment),
+                                    int(blob_means_updates),
+                                    bool(freeze_blob_features))
+        _MULTI_SWEEP_CACHE[cache_key] = fn
+    state, key = fn(key, state, pj, vj, fj, ba, ha, damp)
     return state, key
 
 
 # Sentinel index marking outlier datapoints in the rendered palette.  The
 # Gibbs sampler uses index == num_blobs for outliers; we clip those before
 # the palette lookup and color them with this entry instead.
-OUTLIER_BGR = np.array([60, 60, 60], dtype=np.uint8)  # dark gray
+# Outliers (Gibbs couldn't assign a datapoint to any cluster) get a SOLID, light,
+# neutral gray — perceptually distinct from the saturated cluster palettes and
+# clearly readable as "unassigned", instead of a muddy darkened tint.
+OUTLIER_BGR = np.array([205, 205, 210], dtype=np.uint8)
 
 
 def extract_assignments(state) -> Tuple[np.ndarray, np.ndarray]:
@@ -529,6 +1229,204 @@ def extract_assignments(state) -> Tuple[np.ndarray, np.ndarray]:
     blob_out[is_outlier] = -1
     hyperblob_per_dp[is_outlier] = -1
     return blob_out, hyperblob_per_dp
+
+
+@jax.jit
+def _blob_weights_mean_jit(state):
+    """Closed-form Dirichlet-multinomial posterior MEAN of the per-blob weights.
+
+    Models ``dense_eval_blob_weights`` (dino.py:643) — same ``segment_sum`` over
+    the sparse blob_assignments — but returns the posterior mean
+    ``w_b = (beta + n_b) / (n_blobs * beta + N_in)`` instead of a Dirichlet
+    sample, so the matter-weighted-Jaccard metric is deterministic across runs
+    (Rao-Blackwellized, ~10x cheaper, no PRNG).  Outliers (assignment ==
+    n_blobs) fall outside ``[0, n_blobs)`` and are dropped by ``segment_sum``.
+    """
+    num_blobs = state.hypers.n_blobs
+    prior_beta = state.hypers.beta
+    blob_idxs = state.datapoints_state.blob_assignments
+    blob_counts = jax.ops.segment_sum(jnp.ones_like(blob_idxs), blob_idxs,
+                                      num_segments=num_blobs)
+    new_betas = prior_beta + blob_counts
+    return new_betas / jnp.sum(new_betas)
+
+
+def extract_blob_weights(state, key) -> Tuple[np.ndarray, object]:
+    """Posterior-mean per-blob weights (length ``n_blobs``) for the matter-
+    weighted Jaccard scorer.  Returns ``(weights_np, new_key)``.  The single
+    ``np.asarray`` host transfer happens once per frame in the calibration loop,
+    never in an inner kernel; the mean is deterministic, so ``key`` is only
+    advanced for API symmetry with the sampling variant.
+    """
+    w = _blob_weights_mean_jit(state)
+    weights_np = np.asarray(w)
+    key, _ = jax.random.split(key)
+    return weights_np, key
+
+
+def run_tracker_from_cache(positions, velocities, features, indices, *, yaml_cfg,
+                           num_blobs: int = NUM_BLOBS, num_hyperblobs: int = NUM_HYPERBLOBS,
+                           num_sweeps: int = 1, capture_blob_weights: bool = False,
+                           sam_segmentation: Optional[np.ndarray] = None,
+                           key_seed: int = 0,
+                           capture_data_loglik: bool = False) -> dict:
+    """Run ONLY the GenMatter Gibbs tracker over PRE-COMPUTED perception outputs
+    (positions/velocities/features as cached in the pseudo-label .npz).
+
+    The depth+flow+DINO perception is invariant to the calibration hyperparameters
+    — only the Gibbs tracker consumes them — so recomputing it on every EM /
+    accept-test trial is pure waste (and starves the GPU).  This skips perception
+    entirely and is numerically identical to ``run_streaming_live``'s tracker path
+    for the same frames: same K-means init on frame 0, same per-frame
+    ``step_multi_sweep``, same PRNGKey(key_seed).
+
+    positions/velocities : (T, N, 3); features : (T, N, FEATURE_DIM); indices : (N,).
+    Returns the same dict shape the calibrator's tracker runner produces.
+
+    ``sam_segmentation`` : optional ``(H//stride, W//stride, 3)`` RGB pseudo-color
+    frame-0 SAM mask (see ``instance_mask_to_rgb_grid``).  When supplied AND
+    ``yaml_cfg['tracking']['use_sam_frame0']`` is set, the frame-0 ``init_state``
+    seeds one hyperblob per SAM instance instead of flat k-means.  ``indices`` is
+    reused as the per-datapoint subsample map into that grid (it already indexes
+    the same stride-8 grid), so the SAM mask supplied here must correspond to the
+    SAME video frame as ``positions[0]`` (the cache's first frame) for a 0-frame
+    init offset.
+    """
+    import time as _time
+    pos = np.asarray(positions, dtype=np.float32)
+    vel = np.asarray(velocities, dtype=np.float32)
+    feat = np.asarray(features, dtype=np.float32)
+    T = int(pos.shape[0])
+    key = jax.random.PRNGKey(key_seed)
+    state = None
+    blob_a_list, hb_a_list, blob_w_list = [], [], []
+    n_blobs_val = None
+    outlier_fracs, step_walls = [], []
+    # Phase-B probabilistic objective: per-frame complete-data log-likelihood
+    # term breakdown, accumulated where the state is LIVE (no offline
+    # re-materialization).  Self-supervised (uses no GT / SAM labels).
+    loglik_terms_list = []
+    loglik_blob_anchor = None   # frame-0 blob appearance, captured post-warmup below
+    if capture_data_loglik:
+        import _data_loglik as _dll
+        _loglik_terms_jit = jax.jit(_dll.frame_data_loglik_terms)
+    # Final-assignment ablation flags (default = vendored behavior); see
+    # ``blob_tracking_gibbs_dino_streaming``.  Python bools closed over by the
+    # jit'd step at build time, so they never trigger a mid-run recompile.
+    _trk = yaml_cfg.get("tracking", {})
+    feature_aware_final = bool(_trk.get("feature_aware_final_assignment",
+                                        _FEATURE_AWARE_FINAL_DEFAULT))
+    final_outlier = bool(_trk.get("final_assignment_outlier",
+                                  _FINAL_OUTLIER_DEFAULT))
+    # When set, the per-frame Gibbs keeps the frame-0 seeded blob->hyperblob
+    # mapping (cluster identity is sticky).  init_state's warmup
+    # (init_gibbs_sweep_dino -> _init_gibbs_scan_step) is BLOB-ONLY and never
+    # re-samples hyperblob membership, so the frame-0 semantic seed survives
+    # warmup; this freeze applies from the very first per-frame sweep below.
+    freeze_hyperblob_assignment = bool(_trk.get("freeze_hyperblob_assignment",
+                                                _FREEZE_HYPERBLOB_ASSIGNMENT_DEFAULT))
+    # CONVERGE anti-bleed lever: per-frame blob-mean refinement count (default 15
+    # = vendored).  jit-static; read from YAML so the cached ablation/render share
+    # one knob.
+    blob_means_updates = int(_trk.get("blob_means_updates_per_frame",
+                                      _BLOB_MEANS_UPDATES_DEFAULT))
+    # Anti-drift: freeze the frame-0 seeded blob/hyperblob appearance (no per-frame
+    # DINO feature-mean update). jit-static; read from YAML; default False = bit-exact.
+    freeze_blob_features = bool(_trk.get("freeze_blob_features",
+                                         _FREEZE_BLOB_FEATURES_DEFAULT))
+    # DAMPED anti-drift (generalizes freeze): feature_update_damping in [0, 1] blends
+    # each per-frame Gibbs feature update back toward the frame-0 anchor
+    # (d=0 == freeze, d=1 == vendored). EXPLICIT damping takes precedence; the blend
+    # path activates only when an explicit damping < 1.0 is set, so configs that set
+    # only freeze_blob_features keep their exact (validated) static-freeze numerics,
+    # and damping-unset / damping=1.0 stays bit-exact vendored. The frame-0 anchor is
+    # captured post-warmup below and passed as a TRACED arg (no recompile per video).
+    _damp_raw = _trk.get("feature_update_damping", None)
+    feature_update_damping = (float(_damp_raw) if _damp_raw is not None else None)
+    use_damp = (feature_update_damping is not None) and (feature_update_damping < 1.0)
+    blob_feat_anchor = None
+    hb_feat_anchor = None
+    for t in range(T):
+        if state is None:
+            # init_state runs K-means + warmup Gibbs on frame 0, then one step on
+            # the same frame (mirrors run_streaming_live's first tracked frame).
+            state, key = init_state(pos[t], vel[t], feat[t], key, yaml_cfg=yaml_cfg,
+                                    num_blobs=num_blobs, num_hyperblobs=num_hyperblobs,
+                                    sam_segmentation=sam_segmentation,
+                                    subsample_indices=indices,
+                                    verbose=False)
+            # Capture the post-warmup frame-0 appearance as the damping anchor
+            # (before the first per-frame step can drift it). Traced from here on.
+            if use_damp:
+                blob_feat_anchor = jnp.asarray(state.blobs_state.blob_features)
+                hb_feat_anchor = jnp.asarray(state.hyperblobs_state.hyperblob_features)
+            # The data_loglik objective scores features against this SAME frozen
+            # frame-0 anchor (captured regardless of damping), so the objective
+            # measures appearance consistency vs the seed instead of rewarding the
+            # drift that fitting the live blob_features would.
+            if capture_data_loglik:
+                loglik_blob_anchor = jnp.asarray(state.blobs_state.blob_features)
+            state, key = step_multi_sweep(state, pos[t], vel[t], feat[t], key,
+                                          num_sweeps=num_sweeps,
+                                          feature_aware_final=feature_aware_final,
+                                          final_outlier=final_outlier,
+                                          freeze_hyperblob_assignment=freeze_hyperblob_assignment,
+                                          blob_means_updates=blob_means_updates,
+                                          freeze_blob_features=freeze_blob_features,
+                                          blob_feat_anchor=blob_feat_anchor,
+                                          hb_feat_anchor=hb_feat_anchor,
+                                          feature_update_damping=feature_update_damping)
+            state.datapoints_state.blob_assignments.block_until_ready()
+        else:
+            t0 = _time.monotonic()
+            state, key = step_multi_sweep(state, pos[t], vel[t], feat[t], key,
+                                          num_sweeps=num_sweeps,
+                                          feature_aware_final=feature_aware_final,
+                                          final_outlier=final_outlier,
+                                          freeze_hyperblob_assignment=freeze_hyperblob_assignment,
+                                          blob_means_updates=blob_means_updates,
+                                          freeze_blob_features=freeze_blob_features,
+                                          blob_feat_anchor=blob_feat_anchor,
+                                          hb_feat_anchor=hb_feat_anchor,
+                                          feature_update_damping=feature_update_damping)
+            state.datapoints_state.blob_assignments.block_until_ready()
+            step_walls.append(_time.monotonic() - t0)
+        blob_a, hyperblob_a = extract_assignments(state)
+        blob_a_list.append(blob_a)
+        hb_a_list.append(hyperblob_a)
+        outlier_fracs.append(float(np.mean(blob_a == -1)))
+        if capture_data_loglik:
+            terms = _loglik_terms_jit(state, loglik_blob_anchor)
+            loglik_terms_list.append({k: float(v) for k, v in terms.items()})
+        if capture_blob_weights:
+            w, key = extract_blob_weights(state, key)
+            blob_w_list.append(w)
+            if n_blobs_val is None:
+                n_blobs_val = int(w.shape[0])
+    out = {
+        "blob_a": np.stack(blob_a_list, axis=0).astype(np.int32),
+        "hyperblob_a": np.stack(hb_a_list, axis=0).astype(np.int32),
+        "matter_fps": float(1.0 / np.median(step_walls)) if step_walls else float("nan"),
+        "outlier_frac_p95": float(np.percentile(outlier_fracs, 95)) if outlier_fracs else float("nan"),
+    }
+    if capture_blob_weights:
+        out["blob_w"] = (np.stack(blob_w_list, axis=0).astype(np.float32)
+                         if blob_w_list else None)
+        out["n_blobs"] = n_blobs_val
+        out["indices"] = np.asarray(indices)
+    if capture_data_loglik and loglik_terms_list:
+        # Video-level objective = mean over frames of each per-datapoint-mean term
+        # (comparable across videos). "data_loglik" is the headline scalar (the
+        # full complete-data density); the rest are exposed for the Phase-B proto
+        # to pick the best GT-correlating formulation.
+        keys = loglik_terms_list[0].keys()
+        agg = {k: float(np.mean([d[k] for d in loglik_terms_list])) for k in keys}
+        out["data_loglik_terms"] = agg
+        # Headline = the ANCHOR-referenced objective (the naive live-feature "full"
+        # rewards drift). _pick_data_loglik selects the configured variant from the
+        # terms dict; this is only the fallback scalar.
+        out["data_loglik"] = agg.get("anchor_pos_feat", agg.get("feat_anchor", float("nan")))
+    return out
 
 
 # ---------------- Visualization ----------------
@@ -672,6 +1570,63 @@ def _nn_fill_grid(grid: np.ndarray) -> np.ndarray:
     return out
 
 
+def _edge_aware_upsample(label_grid: np.ndarray, h: int, w: int,
+                         rgb_guide: np.ndarray) -> np.ndarray:
+    """Edge-aware upsample of a coarse ``(gh, gw)`` integer ``label_grid`` to
+    ``(h, w)``, snapping label boundaries to the edges of ``rgb_guide`` WITHOUT
+    changing any underlying assignment (output labels are always one of the
+    coarse input labels — this is a relabel-free joint upsample).
+
+    Cheap joint/guided nearest-neighbour: each coarse cell carries a
+    representative color (the area-downsampled guide). For every full-res pixel
+    we consider the 2x2 block of coarse cells straddling it and pick the cell
+    whose representative color is closest (squared L2) to that pixel's actual
+    guide color. The label boundary therefore lands on the RGB edge between two
+    cells instead of the blocky cell border — the stride-8 ``cv2`` nearest
+    upsample's coarse staircase becomes a crisp, image-aligned contour.
+
+    All gathers are C-speed ``cv2.resize`` (INTER_NEAREST) of the coarse grids —
+    the per-cell color map and the four 2x2 neighbour candidates are built by
+    NEAREST-upsampling rolled copies of the coarse arrays, and the color test
+    runs on a single luma channel — so the whole pass is a few ms at 640x360
+    (no slow ``np.ix_`` fancy-index gathers, no per-pixel Python loop).
+    """
+    gh, gw = label_grid.shape
+    lab_c = label_grid.astype(np.int32)
+    cell_rgb = cv2.resize(rgb_guide, (gw, gh), interpolation=cv2.INTER_AREA)
+    # Single luma channel for the color test (cuts the per-candidate distance to
+    # 1 channel; boundaries snap on intensity edges, which is what reads as the
+    # cluster contour). int16 to hold signed differences.
+    cell_y = (0.114 * cell_rgb[..., 0] + 0.587 * cell_rgb[..., 1]
+              + 0.299 * cell_rgb[..., 2]).astype(np.int16)
+    guide = rgb_guide if rgb_guide.shape[:2] == (h, w) else \
+        cv2.resize(rgb_guide, (w, h), interpolation=cv2.INTER_AREA)
+    guide_y = cv2.cvtColor(guide, cv2.COLOR_BGR2GRAY).astype(np.int16)  # C-fast luma
+
+    def _up(arr):
+        return cv2.resize(arr, (w, h), interpolation=cv2.INTER_NEAREST)
+
+    best_lab = None
+    best_d = None
+    # 2x2 neighbour candidates: the coarse grid and its ±1-cell rolls. Each
+    # NEAREST-upsamples to full res for ~0.04 ms; we then pick, per pixel, the
+    # candidate whose cell luma is closest to the pixel's luma.
+    for dy in (0, 1):
+        for dx in (0, 1):
+            lab_s = np.roll(np.roll(lab_c, -dy, axis=0), -dx, axis=1)
+            celly_s = np.roll(np.roll(cell_y, -dy, axis=0), -dx, axis=1)
+            cand_lab = _up(lab_s)
+            cand_y = _up(celly_s).astype(np.int16)
+            d = np.abs(guide_y - cand_y)                       # luma distance (h, w)
+            if best_lab is None:
+                best_lab, best_d = cand_lab, d
+            else:
+                take = d < best_d
+                best_lab = np.where(take, cand_lab, best_lab)
+                best_d = np.where(take, d, best_d)
+    return best_lab.astype(np.int32)
+
+
 def labels_to_filled_grid(labels: np.ndarray, indices: np.ndarray,
                           gh: int, gw: int, drop_outliers: bool = True) -> np.ndarray:
     """Sparse -> dense label adapter (shares ``render_matter_tile``'s NN-fill).
@@ -689,11 +1644,84 @@ def labels_to_filled_grid(labels: np.ndarray, indices: np.ndarray,
     return _nn_fill_grid(grid.reshape(gh, gw))
 
 
+_CLUSTER_PALETTE_CACHE: dict = {}
+
+
+def _cluster_palette_for(num_fg: int, n_total: int) -> np.ndarray:
+    """Memoized vivid-fg / muted-bg CLUSTER palette (``build_cluster_palette``)
+    keyed on ``(num_fg, n_total)`` so render_matter_tile doesn't rebuild it
+    every frame (deterministic, so caching is bit-exact)."""
+    key = (int(num_fg), int(n_total))
+    pal = _CLUSTER_PALETTE_CACHE.get(key)
+    if pal is None:
+        pal = build_cluster_palette(num_fg, n_total)
+        _CLUSTER_PALETTE_CACHE[key] = pal
+    return pal
+
+
+def _avg_rgb_by_label(label_map: np.ndarray, rgb_guide: np.ndarray,
+                      h: int, w: int) -> np.ndarray:
+    """Paint each pixel with the MEAN BGR of its label's region — i.e. the
+    average colour of the particle assigned to it. ``label_map`` is the (h, w)
+    integer label image; ``rgb_guide`` is the source BGR frame (resized to
+    (h, w) if needed). Vectorized per-label mean via bincount."""
+    guide = rgb_guide if rgb_guide.shape[:2] == (h, w) else \
+        cv2.resize(rgb_guide, (w, h), interpolation=cv2.INTER_AREA)
+    lab = np.asarray(label_map).reshape(-1).astype(np.int64)
+    rgb = guide.reshape(-1, 3).astype(np.float32)
+    n = int(lab.max()) + 1 if lab.size else 1
+    counts = np.maximum(np.bincount(lab, minlength=n).astype(np.float32), 1.0)
+    means = np.empty((n, 3), dtype=np.float32)
+    for c in range(3):
+        means[:, c] = np.bincount(lab, weights=rgb[:, c], minlength=n) / counts
+    return means[np.asarray(label_map)].clip(0, 255).astype(np.uint8)
+
+
+def compute_blob_color_lut(blob_assignments: np.ndarray, indices: np.ndarray,
+                           rgb_guide: np.ndarray, h: int = 360, w: int = 640,
+                           stride: int = STRIDE) -> np.ndarray:
+    """Per-blob mean BGR at this frame's datapoints — the LOCKED 'colour of each
+    particle'. Compute it ONCE (frame 1) and thread it back into
+    ``render_matter_tile(blob_color_lut=...)`` so each particle keeps a fixed
+    colour across frames (no per-frame colour drift / flicker), even as it moves.
+
+    Returns a ``(BLOB_PALETTE.shape[0], 3)`` uint8 LUT indexed by blob id. Blobs
+    with no datapoints this frame fall back to the global mean colour. The grid
+    cell each datapoint occupies (``indices``) is coloured from ``rgb_guide``
+    downsampled to the stride grid."""
+    gh, gw = h // stride, w // stride
+    guide = rgb_guide if rgb_guide.shape[:2] == (h, w) else \
+        cv2.resize(rgb_guide, (w, h), interpolation=cv2.INTER_AREA)
+    cell_rgb = cv2.resize(guide, (gw, gh), interpolation=cv2.INTER_AREA
+                          ).reshape(-1, 3).astype(np.float32)
+    lab = np.asarray(blob_assignments).reshape(-1)
+    idx = np.asarray(indices).reshape(-1)
+    n = BLOB_PALETTE.shape[0]
+    lut = np.zeros((n, 3), dtype=np.float32)
+    valid = lab >= 0
+    if not valid.any():
+        return lut.astype(np.uint8)
+    lab_v = np.clip(lab[valid], 0, n - 1).astype(np.int64)
+    rgb_v = cell_rgb[idx[valid]]
+    counts = np.bincount(lab_v, minlength=n).astype(np.float32)
+    for c in range(3):
+        lut[:, c] = np.bincount(lab_v, weights=rgb_v[:, c], minlength=n)
+    nz = counts > 0
+    lut[nz] /= counts[nz, None]
+    lut[~nz] = rgb_v.mean(axis=0)
+    return lut.clip(0, 255).astype(np.uint8)
+
+
 def render_matter_tile(blob_assignments: np.ndarray,
                         hyperblob_per_dp: np.ndarray,
                         indices: np.ndarray,
                         h: int = 360, w: int = 640,
-                        stride: int = STRIDE) -> Tuple[np.ndarray, np.ndarray]:
+                        stride: int = STRIDE,
+                        rgb_guide: Optional[np.ndarray] = None,
+                        num_fg_hyperblobs: Optional[int] = None,
+                        particle_avg_rgb: bool = False,
+                        blob_color_lut: Optional[np.ndarray] = None,
+                        ) -> Tuple[np.ndarray, np.ndarray]:
     """Project the per-datapoint blob (and hyperblob) labels back into a
     (h, w, 3) BGR image, with each datapoint covering a stride x stride block
     and unassigned grid cells filled by NN from neighbours.
@@ -708,12 +1736,30 @@ def render_matter_tile(blob_assignments: np.ndarray,
     subsampler skipped) are filled by NN from their nearest *non-outlier*
     neighbour.
 
+    ``rgb_guide`` (the BGR frame, any size): when supplied, the coarse stride-8
+    label grids are upsampled EDGE-AWARE (``_edge_aware_upsample``) so cluster /
+    particle boundaries snap to the image edges instead of the blocky stride-8
+    staircase. Assignments are unchanged — only the upsample boundary moves.
+    None falls back to the original ``cv2`` nearest upsample.
+
+    ``num_fg_hyperblobs``: number of seeded OBJECT-instance hyperblobs (the low
+    ids 0..num_fg-1). When supplied, the CLUSTER tile uses the vivid-fg /
+    muted-bg palette (``build_cluster_palette``) so the tracked object pops; the
+    PARTICLE tile always keeps the full rainbow ``BLOB_PALETTE``. None falls
+    back to the rainbow ``HYPERBLOB_PALETTE`` for clusters too.
+
     Returns (blob_bgr, hyperblob_bgr).  Both are uint8 (h, w, 3) BGR.
     """
     gh, gw = h // stride, w // stride
 
     blob_palette = BLOB_PALETTE
-    hyper_palette = HYPERBLOB_PALETTE
+    # Cluster (hyperblob) tile: vivid-fg / muted-bg palette when we know the
+    # foreground instance count; otherwise the legacy rainbow palette. Both are
+    # sized to HYPERBLOB_PALETTE's length so the label lookup never overruns.
+    if num_fg_hyperblobs is not None:
+        hyper_palette = _cluster_palette_for(num_fg_hyperblobs, HYPERBLOB_PALETTE.shape[0])
+    else:
+        hyper_palette = HYPERBLOB_PALETTE
     n_blobs = blob_palette.shape[0]
     n_hypers = hyper_palette.shape[0]
 
@@ -744,33 +1790,49 @@ def render_matter_tile(blob_assignments: np.ndarray,
     blob_grid = _nn_fill_grid(blob_grid)
     hyper_grid = _nn_fill_grid(hyper_grid)
 
-    blob_full = cv2.resize(blob_grid.astype(np.int32), (w, h),
-                            interpolation=cv2.INTER_NEAREST)
-    hyper_full = cv2.resize(hyper_grid.astype(np.int32), (w, h),
-                             interpolation=cv2.INTER_NEAREST)
+    if rgb_guide is not None:
+        # Edge-aware joint upsample: snap label boundaries to RGB edges so the
+        # stride-8 staircase becomes crisp. Assignments are preserved exactly
+        # (output is always one of the coarse labels).
+        blob_full = _edge_aware_upsample(blob_grid.astype(np.int32), h, w, rgb_guide)
+        hyper_full = _edge_aware_upsample(hyper_grid.astype(np.int32), h, w, rgb_guide)
+    else:
+        blob_full = cv2.resize(blob_grid.astype(np.int32), (w, h),
+                                interpolation=cv2.INTER_NEAREST)
+        hyper_full = cv2.resize(hyper_grid.astype(np.int32), (w, h),
+                                 interpolation=cv2.INTER_NEAREST)
     outlier_full = cv2.resize(outlier_grid.astype(np.uint8), (w, h),
                                interpolation=cv2.INTER_NEAREST).astype(bool)
 
-    blob_bgr = blob_palette[blob_full].astype(np.uint8)
+    # PARTICLE tile colouring, in precedence order:
+    #  1. blob_color_lut (LOCKED frame-1 colours, from compute_blob_color_lut):
+    #     each blob id keeps its fixed mean BGR across frames — no colour drift.
+    #  2. particle_avg_rgb (+ rgb_guide): per-frame mean BGR of each particle's
+    #     region (true-colour posterization), recomputed every frame.
+    #  3. default: the rainbow BLOB_PALETTE keyed by id.
+    if blob_color_lut is not None:
+        lut = np.asarray(blob_color_lut)
+        blob_bgr = lut[np.clip(blob_full, 0, lut.shape[0] - 1)].astype(np.uint8)
+    elif particle_avg_rgb and rgb_guide is not None:
+        blob_bgr = _avg_rgb_by_label(blob_full, rgb_guide, h, w)
+    else:
+        blob_bgr = blob_palette[blob_full].astype(np.uint8)
     hyper_bgr = hyper_palette[hyper_full].astype(np.uint8)
     if outlier_full.any():
-        m = outlier_full[..., None]
-        tint = OUTLIER_BGR[None, None, :].astype(np.uint16)
-        blob_bgr = np.where(m,
-                             ((blob_bgr.astype(np.uint16) + tint) // 2).astype(np.uint8),
-                             blob_bgr)
-        hyper_bgr = np.where(m,
-                              ((hyper_bgr.astype(np.uint16) + tint) // 2).astype(np.uint8),
-                              hyper_bgr)
+        # SOLID outlier color (not a 50/50 darken) so outliers read clearly.
+        blob_bgr[outlier_full] = OUTLIER_BGR
+        hyper_bgr[outlier_full] = OUTLIER_BGR
     return blob_bgr, hyper_bgr
 
 
-# Default 3D-view rotation for the ROW3 point-cloud tiles. ~25° yaw + slight
-# downward pitch gives a 3/4 view that shows depth structure without losing
-# orientation cues. Use the same rotation for both tiles so the cluster and
-# particle views are spatially comparable.
-POINTCLOUD_YAW_DEG = 25.0
-POINTCLOUD_PITCH_DEG = -10.0
+# Default 3D-view rotation for the ROW3 point-cloud tiles. A SMALL ~3° yaw
+# (no pitch) keeps the view nearly FULL-FRONTAL with the camera — just enough
+# parallax to read depth without the off-kilter skew of a 3/4 orbit. (At exactly
+# 0° a pinhole reprojection cancels depth and collapses to the flat 2D image, so
+# a couple degrees is the floor for any 3D to be visible.) Pitch=0 keeps the
+# scene level and vertically centered.
+POINTCLOUD_YAW_DEG = 1.5
+POINTCLOUD_PITCH_DEG = 0.0
 
 
 def _build_pointcloud_projection(
@@ -801,7 +1863,16 @@ def _build_pointcloud_projection(
     H, W = depth_hxw.shape
     out_H, out_W = out_hw
     empty = (np.empty(0, dtype=np.int32),) * 4
-    empty_ret = (*empty, 0.0)
+    empty_ret = (*empty, 0.0, None)
+
+    # The depth model emits RELATIVE INVERSE depth (disparity-like: near = large
+    # value). Convert to the same pseudo-metric Z the tracker unprojects with
+    # (``_depth_to_Z``: near = small Z, far = large Z) BEFORE unprojecting the
+    # cloud. Feeding the raw inverse depth straight in as Z turns the scene
+    # inside-out (near objects pushed far, far objects pulled near) and is the
+    # dominant source of the "warped sheet" distortion — converting here makes
+    # the point cloud geometry consistent with the camera the tracker sees.
+    depth_hxw = _depth_to_Z(np.asarray(depth_hxw, dtype=np.float32))
 
     ys, xs = np.meshgrid(
         np.arange(0, H, point_subsample),
@@ -835,7 +1906,8 @@ def _build_pointcloud_projection(
     Rx = np.array([[1.,            0.,             0.],
                    [0.,  np.cos(pitch), -np.sin(pitch)],
                    [0.,  np.sin(pitch),  np.cos(pitch)]], dtype=np.float32)
-    pts_rot = pts_c @ (Rx @ Ry).T
+    R_pc = (Rx @ Ry).astype(np.float32)   # camera-frame -> view rotation
+    pts_rot = pts_c @ R_pc.T
     pts_rot[:, 2] += centroid[2]
 
     z_view = pts_rot[:, 2]
@@ -847,20 +1919,26 @@ def _build_pointcloud_projection(
     ys = ys[in_front]
     xs = xs[in_front]
 
-    # Uniform focal length keeps 3D circles round.  If the caller didn't
-    # supply one, auto-fit so 98 % of the cloud lands inside ~90 % of the
-    # tile, using the 98 th percentile rather than abs-max so a handful of
-    # stray far-away points don't zoom the whole view out.  IMPORTANT: the
-    # autofit jitters frame-to-frame because the percentile XY extents
-    # fluctuate with depth-normalization noise even when the 3D scene is
-    # stable, so callers should compute autofit ONCE and pass the returned
-    # value back in to freeze the framing.
+    # Uniform focal length keeps 3D circles round.  Frame to the CAMERA's
+    # aspect ratio (a W/H-wide window centered in the tile) rather than the full
+    # 960-px tile width: the scene is wider than it is tall, so fitting to the
+    # tile width collapsed the cloud into a thin horizontal band.  Fitting to a
+    # camera-aspect window instead fills the tile height and keeps the view
+    # consistent with the source camera's framing (the "calibrated frustum").
+    # Auto-fit uses the 96 th percentile (robust to a few stray far points);
+    # callers freeze the value across frames by threading the return back in.
     if focal_length is None or focal_length <= 0.0:
-        margin = 0.9
-        x_extent = float(np.percentile(np.abs(pts_rot[:, 0]), 98)) + 1e-3
-        y_extent = float(np.percentile(np.abs(pts_rot[:, 1]), 98)) + 1e-3
+        margin = 0.98   # fill the tile (FROZEN frame-0 focal stays stable, no pop)
+        cam_aspect = float(W) / float(H)                 # source camera aspect
+        # camera-aspect window, but never wider than the tile itself (so narrow
+        # 1×5 tiles don't overflow / get culled).
+        eff_W = min(out_H * cam_aspect, float(out_W))
+        # 90th pct (was 96th): frame to the BULK of the cloud so it fills the tile;
+        # the outer ~10% of points spill into the margin / crop at the edges.
+        x_extent = float(np.percentile(np.abs(pts_rot[:, 0]), 90)) + 1e-3
+        y_extent = float(np.percentile(np.abs(pts_rot[:, 1]), 90)) + 1e-3
         z_ref = float(np.median(z_view))
-        f_x = (margin * 0.5 * out_W) * z_ref / x_extent
+        f_x = (margin * 0.5 * eff_W) * z_ref / x_extent
         f_y = (margin * 0.5 * out_H) * z_ref / y_extent
         f = float(min(f_x, f_y))
     else:
@@ -877,8 +1955,13 @@ def _build_pointcloud_projection(
     z_view = z_view[in_bounds]
     ys = ys[in_bounds]; xs = xs[in_bounds]
 
+    # Projection parameters so callers can render OTHER 3D entities (e.g. the
+    # particle covariance ellipsoids in ROW4) into the SAME rotated view —
+    # aligned with this point cloud.
+    proj = {"centroid": centroid.astype(np.float32), "R": R_pc,
+            "focal": float(f), "out_cx": float(out_cx), "out_cy": float(out_cy)}
     order = np.argsort(-z_view, kind="stable")
-    return u[order], v[order], ys[order], xs[order], f
+    return u[order], v[order], ys[order], xs[order], f, proj
 
 
 # Memoized disk-offset tables for the vectorized splat (one np.array each for
@@ -939,7 +2022,7 @@ def render_pointcloud_tile(depth_hxw: np.ndarray,
                             yaw_deg: float = POINTCLOUD_YAW_DEG,
                             pitch_deg: float = POINTCLOUD_PITCH_DEG,
                             point_subsample: int = 2,
-                            point_size: int = 1,
+                            point_size: int = 2,
                             bg_bgr: Tuple[int, int, int] = (18, 18, 26),
                             out_hw: Tuple[int, int] = (360, 960),
                             focal_length: Optional[float] = None,
@@ -963,7 +2046,7 @@ def render_pointcloud_tile(depth_hxw: np.ndarray,
     is None the projection auto-fits per frame (jitters); pass a frozen value
     to stabilize framing across frames.
     """
-    u, v, ys, xs, _f = _build_pointcloud_projection(
+    u, v, ys, xs, _f, _proj = _build_pointcloud_projection(
         depth_hxw, intr, yaw_deg, pitch_deg, point_subsample, out_hw,
         focal_length=focal_length)
     if u.size == 0:
@@ -981,7 +2064,7 @@ def render_pointcloud_tiles_pair(
     yaw_deg: float = POINTCLOUD_YAW_DEG,
     pitch_deg: float = POINTCLOUD_PITCH_DEG,
     point_subsample: int = 2,
-    point_size: int = 1,
+    point_size: int = 2,
     bg_bgr: Tuple[int, int, int] = (18, 18, 26),
     out_hw: Tuple[int, int] = (360, 960),
     focal_length: Optional[float] = None,
@@ -990,21 +2073,78 @@ def render_pointcloud_tiles_pair(
     sources.  Builds the projection once and splats twice — saves roughly half
     the per-frame pointcloud cost vs. two ``render_pointcloud_tile`` calls.
 
-    Returns ``(tile_a, tile_b, focal_length)``.  Pass ``focal_length`` back in
-    on subsequent calls to freeze framing across frames.
+    Returns ``(tile_a, tile_b, focal_length, proj)``.  Pass ``focal_length``
+    back in on subsequent calls to freeze framing across frames; pass ``proj``
+    to ``render_particle_ellipsoid_tile`` to draw aligned 3D ellipsoids (ROW4).
     """
     out_H, out_W = out_hw
-    u, v, ys, xs, f_used = _build_pointcloud_projection(
+    u, v, ys, xs, f_used, proj = _build_pointcloud_projection(
         depth_hxw, intr, yaw_deg, pitch_deg, point_subsample, out_hw,
         focal_length=focal_length)
     if u.size == 0:
         blank = np.full((out_H, out_W, 3), bg_bgr, dtype=np.uint8)
-        return blank.copy(), blank.copy(), f_used
+        return blank.copy(), blank.copy(), f_used, proj
     colors_a = color_a_bgr[ys, xs].astype(np.uint8)
     colors_b = color_b_bgr[ys, xs].astype(np.uint8)
     tile_a = _splat_pointcloud(u, v, colors_a, out_hw, point_size, bg_bgr)
     tile_b = _splat_pointcloud(u, v, colors_b, out_hw, point_size, bg_bgr)
-    return tile_a, tile_b, f_used
+    return tile_a, tile_b, f_used, proj
+
+
+def render_particle_ellipsoid_tile(means_3d: np.ndarray, covs_3d: np.ndarray,
+                                   palette: np.ndarray, proj: Optional[dict], *,
+                                   out_hw: Tuple[int, int] = (360, 960),
+                                   sigma_scale: float = 1.5,
+                                   bg_bgr: Tuple[int, int, int] = (18, 18, 26),
+                                   alpha: float = 0.6) -> np.ndarray:
+    """Render the PROBABILISTIC particles as 3D covariance ellipsoids, in the
+    SAME rotated view as the point cloud (``proj`` returned by
+    ``render_pointcloud_tiles_pair``) so ROW4 lines up with ROW3.
+
+    Each particle is a 3D Gaussian (``means_3d[i]`` + ``covs_3d[i]``): we rotate
+    it into the view frame, perspective-project the mean with the point cloud's
+    focal, project the covariance to a 2D ellipse, and draw a filled translucent
+    Gaussian — depth-sorted far→near. This shows each particle's position AND
+    spread/uncertainty in 3D, rather than hard per-pixel colors.
+    """
+    out_H, out_W = out_hw
+    canvas = np.full((out_H, out_W, 3), bg_bgr, dtype=np.uint8)
+    means = None if means_3d is None else np.asarray(means_3d, dtype=np.float32)
+    if proj is None or means is None or means.shape[0] == 0:
+        return canvas
+    R = np.asarray(proj["R"], dtype=np.float32)
+    centroid = np.asarray(proj["centroid"], dtype=np.float32)
+    f = float(proj["focal"])
+    if f <= 0.0:
+        return canvas
+    pc_intr = Intrinsics(fx=f, fy=f, cx=float(proj["out_cx"]), cy=float(proj["out_cy"]))
+    m_rot = (means - centroid) @ R.T            # match the cloud's rotation
+    m_rot[:, 2] += centroid[2]
+    uv = project_3d_to_2d(m_rot, pc_intr)
+    overlay = np.zeros_like(canvas)
+    mask = np.zeros((out_H, out_W), dtype=np.uint8)
+    n = means.shape[0]
+    for i in np.argsort(-m_rot[:, 2]):          # painter: far → near
+        u, v = uv[i]
+        if not (np.isfinite(u) and np.isfinite(v)):
+            continue
+        ui, vi = int(round(u)), int(round(v))
+        if ui < -200 or ui > out_W + 200 or vi < -200 or vi > out_H + 200:
+            continue
+        cov_rot = R @ np.asarray(covs_3d[i], dtype=np.float64) @ R.T
+        axes, ang = covariance_to_ellipse_2d(cov_rot, m_rot[i], pc_intr,
+                                             sigma_scale=sigma_scale,
+                                             max_half=min(out_W, out_H) * 0.45)
+        color = (int(palette[i, 0]), int(palette[i, 1]), int(palette[i, 2]))
+        cv2.ellipse(overlay, (ui, vi), (int(axes[0]), int(axes[1])), ang, 0, 360,
+                    color, thickness=-1, lineType=cv2.LINE_AA)
+        cv2.ellipse(mask, (ui, vi), (int(axes[0]), int(axes[1])), ang, 0, 360,
+                    255, thickness=-1, lineType=cv2.LINE_AA)
+        cv2.ellipse(canvas, (ui, vi), (int(axes[0]), int(axes[1])), ang, 0, 360,
+                    color, thickness=1, lineType=cv2.LINE_AA)
+    m = (mask[..., None].astype(np.float32) / 255.0) * alpha
+    out = canvas.astype(np.float32) * (1.0 - m) + overlay.astype(np.float32) * m
+    return out.clip(0, 255).astype(np.uint8)
 
 
 # ---------------- Self-test ----------------

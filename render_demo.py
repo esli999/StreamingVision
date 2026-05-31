@@ -169,19 +169,30 @@ GID    = MonotonicId()
 
 # ---------- Models ----------
 
+DEPTH_CKPT = "depth-anything/Depth-Anything-V2-Small-hf"
+SEA_CFG    = "third_party/SEA-RAFT/config/eval/spring-M.json"
+
+
+def _load_depth_model(device: str = DEVICE):
+    """Load DepthAnythingV2-Small (HF) processor + fp16 model. Returns (proc, model)."""
+    proc  = AutoImageProcessor.from_pretrained(DEPTH_CKPT)
+    model = AutoModelForDepthEstimation.from_pretrained(
+                DEPTH_CKPT, torch_dtype=torch.float16).to(device).eval()
+    return proc, model
+
+
+def _load_flow_model(device: str = DEVICE):
+    """Load SEA-RAFT (Tartan-C-T-TSKH-spring540x960-M). Returns the model only."""
+    with open(SEA_CFG) as f:
+        cfg = json.load(f)
+    sea_args = argparse.Namespace(**cfg); sea_args.iters = 4; sea_args.scale = 0
+    return RAFT.from_pretrained("MemorySlices/Tartan-C-T-TSKH-spring540x960-M",
+                                args=sea_args).to(device).eval()
+
+
 print("loading models...")
-depth_ckpt  = "depth-anything/Depth-Anything-V2-Small-hf"
-depth_proc  = AutoImageProcessor.from_pretrained(depth_ckpt)
-depth_model = AutoModelForDepthEstimation.from_pretrained(
-                  depth_ckpt, torch_dtype=torch.float16).to(DEVICE).eval()
-
-SEA_CFG = "third_party/SEA-RAFT/config/eval/spring-M.json"
-with open(SEA_CFG) as f:
-    cfg = json.load(f)
-sea_args = argparse.Namespace(**cfg); sea_args.iters = 4; sea_args.scale = 0
-flow_model = RAFT.from_pretrained("MemorySlices/Tartan-C-T-TSKH-spring540x960-M",
-                                  args=sea_args).to(DEVICE).eval()
-
+depth_proc, depth_model = _load_depth_model(DEVICE)
+flow_model = _load_flow_model(DEVICE)
 dino_model = streaming_dino.load_dino(DEVICE)
 print("models loaded.")
 
@@ -475,6 +486,26 @@ class MatterWorker(threading.Thread):
         self.yaml_cfg = genmatter_rt.load_yaml_hypers(config_path)
         self._num_blobs = int(self.yaml_cfg["tracking"]["num_blobs"])
         self._num_hyperblobs = int(self.yaml_cfg["tracking"]["num_hyperblobs"])
+        # Per-frame Gibbs sweeps: >1 stabilizes the particles (the 1-sweep live
+        # path is noisy — particles "fly"). Read from config (default 1 keeps the
+        # original real-time behavior; the render config sets ~4).
+        self._gibbs_sweeps = int(self.yaml_cfg["tracking"].get(
+            "num_gibbs_sweeps_per_frame", 1))
+        # "Fixed cluster view" tracking flags (Python bools, jit-static in
+        # genmatter_rt's step_multi_sweep -> one compile per combo). step() /
+        # step_multi_sweep() DEFAULT these to the vendored-behavior False, so we
+        # MUST read them from the YAML and thread them through explicitly or the
+        # v2 cluster fix never reaches the live loop. See
+        # blob_tracking_gibbs_dino_streaming for semantics.
+        _trk = self.yaml_cfg["tracking"]
+        self._feature_aware_final = bool(_trk.get(
+            "feature_aware_final_assignment",
+            genmatter_rt._FEATURE_AWARE_FINAL_DEFAULT))
+        self._final_outlier = bool(_trk.get(
+            "final_assignment_outlier", genmatter_rt._FINAL_OUTLIER_DEFAULT))
+        self._freeze_hyperblob_assignment = bool(_trk.get(
+            "freeze_hyperblob_assignment",
+            genmatter_rt._FREEZE_HYPERBLOB_ASSIGNMENT_DEFAULT))
         # SAM-anchored semantic init (Step 3): if tracking.use_sam_frame0 is set
         # and the cached frame-0 SAM mask exists, load it (RGB) so init_state can
         # seed one hyperblob per SAM instance.  Downsampled to the stride-8 grid
@@ -569,12 +600,20 @@ class MatterWorker(threading.Thread):
                             verbose=True)
                         # Pay the per-step JIT cost up front so steady-state
                         # latency below is honest.
-                        self._state, self._key = genmatter_rt.step(
-                            self._state, positions, velocities, features, self._key)
+                        self._state, self._key = genmatter_rt.step_multi_sweep(
+                            self._state, positions, velocities, features, self._key,
+                            num_sweeps=self._gibbs_sweeps,
+                            feature_aware_final=self._feature_aware_final,
+                            final_outlier=self._final_outlier,
+                            freeze_hyperblob_assignment=self._freeze_hyperblob_assignment)
                         print(f"[MatterWorker] init complete.")
                     else:
-                        self._state, self._key = genmatter_rt.step(
-                            self._state, positions, velocities, features, self._key)
+                        self._state, self._key = genmatter_rt.step_multi_sweep(
+                            self._state, positions, velocities, features, self._key,
+                            num_sweeps=self._gibbs_sweeps,
+                            feature_aware_final=self._feature_aware_final,
+                            final_outlier=self._final_outlier,
+                            freeze_hyperblob_assignment=self._freeze_hyperblob_assignment)
                     self._state.datapoints_state.blob_assignments.block_until_ready()
 
                 blob_a, hyperblob_a = genmatter_rt.extract_assignments(self._state)
@@ -615,13 +654,25 @@ class MatterWorker(threading.Thread):
                 # per-pixel colors differ — so amortize through the pair API.
                 # Focal length is auto-fit on the first frame, then frozen
                 # via self._pointcloud_focal so the framing stays stable.
-                pointcloud_by_cluster_bgr, pointcloud_by_particle_bgr, f_used = \
+                pointcloud_by_cluster_bgr, pointcloud_by_particle_bgr, f_used, pc_proj = \
                     genmatter_rt.render_pointcloud_tiles_pair(
                         depth_np, pixel_by_cluster_bgr, pixel_by_particle_bgr,
                         self.intrinsics,
                         focal_length=self._pointcloud_focal)
                 if self._pointcloud_focal is None and f_used > 0.0:
                     self._pointcloud_focal = f_used
+
+                # ROW4: the probabilistic particles/clusters as 3D covariance
+                # ellipsoids, drawn in the SAME rotated view as ROW3's cloud
+                # (via pc_proj) so they line up — each particle's 3D mean + spread.
+                particles_3d_bgr = genmatter_rt.render_particle_ellipsoid_tile(
+                    blob_means, blob_covs,
+                    genmatter_rt.BLOB_PALETTE[:blob_means.shape[0]], pc_proj,
+                    sigma_scale=1.0)
+                clusters_3d_bgr = genmatter_rt.render_particle_ellipsoid_tile(
+                    hb_means, hb_covs,
+                    genmatter_rt.HYPERBLOB_PALETTE[:hb_means.shape[0]], pc_proj,
+                    sigma_scale=0.6)
 
                 t1 = time.monotonic()
                 self.out.publish(
@@ -632,6 +683,8 @@ class MatterWorker(threading.Thread):
                         "pixel_by_particle":     pixel_by_particle_bgr,
                         "pointcloud_by_cluster": pointcloud_by_cluster_bgr,
                         "pointcloud_by_particle":pointcloud_by_particle_bgr,
+                        "particles_3d":          particles_3d_bgr,
+                        "clusters_3d":           clusters_3d_bgr,
                         "blob_assignments":      blob_a,
                         "hyperblob_assignments": hyperblob_a,
                     },
@@ -850,8 +903,12 @@ class Recorder(threading.Thread):
     ROW1 = ["rgb",      "depth",    "flow",            "dense_features"]
     ROW2 = ["clusters", "particles", "pixel_by_cluster", "pixel_by_particle"]
     ROW3 = ["pointcloud_by_cluster", "pointcloud_by_particle"]
+    # ROW4: the PROBABILISTIC particles/clusters as 3D covariance ellipsoids,
+    #        drawn in the same rotated view as ROW3 (each particle's 3D mean +
+    #        spread, not hard per-pixel colors).
+    ROW4 = ["particles_3d", "clusters_3d"]
     # Map each tile name to the slot whose version drives its FPS counter
-    # and gid badge.  All ROW2 + ROW3 tiles come from MatterWorker.
+    # and gid badge.  All ROW2 + ROW3 + ROW4 tiles come from MatterWorker.
     TILE_STREAM = {
         "rgb":               "rgb",
         "depth":             "depth",
@@ -863,6 +920,8 @@ class Recorder(threading.Thread):
         "pixel_by_particle": "matter",
         "pointcloud_by_cluster":  "matter",
         "pointcloud_by_particle": "matter",
+        "particles_3d":      "matter",
+        "clusters_3d":       "matter",
     }
 
     def __init__(self, slots, out_path, fps=30, duration_s=10.0,
@@ -874,9 +933,9 @@ class Recorder(threading.Thread):
         self.gpu_name             = gpu_name
         self.args_state           = args_state or {}
         self.W = self.TILE_W * 4 + self.SIDEBAR_W
-        # 3 rows of TILE_H each: ROW1 + ROW2 (4 tiles wide), then ROW3 below
-        # (2 tiles, each spanning 2 cells = 960 wide).
-        self.H = self.TILE_H * 3
+        # 4 rows of TILE_H each: ROW1 + ROW2 (4 tiles wide), then ROW3 (2 wide
+        # point-cloud tiles) + ROW4 (2 wide 3D-ellipsoid tiles), each 960 wide.
+        self.H = self.TILE_H * 4
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         self.writer = cv2.VideoWriter(out_path, fourcc, fps, (self.W, self.H))
         if not self.writer.isOpened():
@@ -944,6 +1003,8 @@ class Recorder(threading.Thread):
             return wide_blank
         cells_imgs["pointcloud_by_cluster"]  = (_wide_payload_or_blank(mat, "pointcloud_by_cluster"),  mat.source_global_id)
         cells_imgs["pointcloud_by_particle"] = (_wide_payload_or_blank(mat, "pointcloud_by_particle"), mat.source_global_id)
+        cells_imgs["particles_3d"] = (_wide_payload_or_blank(mat, "particles_3d"), mat.source_global_id)
+        cells_imgs["clusters_3d"]  = (_wide_payload_or_blank(mat, "clusters_3d"),  mat.source_global_id)
 
         # Resize each tile to its grid cell size, ensure writable, draw label.
         # ROW1+ROW2 cells are 480x360; ROW3 cells are 960x360.
@@ -960,15 +1021,16 @@ class Recorder(threading.Thread):
             cells_imgs[name] = (img, gid)
         for name in self.ROW1 + self.ROW2:
             _prep_tile(name, self.TILE_W)
-        for name in self.ROW3:
+        for name in self.ROW3 + self.ROW4:
             _prep_tile(name, self.WIDE_TILE_W)
 
-        # Compose: stack ROW1 above ROW2 (both 4x480), then stack ROW3 (2x960)
-        # below. Vstack handles the equal-width case since 4*480 == 2*960.
+        # Compose: ROW1 over ROW2 (both 4×480), then ROW3 (2×960 point cloud)
+        # and ROW4 (2×960 3D ellipsoids). Equal widths since 4*480 == 2*960.
         row1 = np.hstack([cells_imgs[n][0] for n in self.ROW1])
         row2 = np.hstack([cells_imgs[n][0] for n in self.ROW2])
         row3 = np.hstack([cells_imgs[n][0] for n in self.ROW3])
-        grid = np.vstack([row1, row2, row3])
+        row4 = np.hstack([cells_imgs[n][0] for n in self.ROW4])
+        grid = np.vstack([row1, row2, row3, row4])
 
         # Total FPS = matter rate (most downstream stage that depends on
         # depth + flow + features). All tile stales feed off rs.gid.
@@ -1072,7 +1134,7 @@ def _warm_threadpool_controller():
 
 def main(out_path="assets/streaming_demo.mp4", duration=10.0, fps=30,
          uncapped_source=False, source_fps=30, config_path=None,
-         sam_frame0_path=None):
+         sam_frame0_path=None, source_path="assets/test.mp4"):
     _warm_threadpool_controller()
     slots = {k: Slot(name=k) for k in ["rgb","depth","flow","features","matter"]}
 
@@ -1080,7 +1142,7 @@ def main(out_path="assets/streaming_demo.mp4", duration=10.0, fps=30,
     # Source pacing: throttle_fps=False disables — workers run flat-out and
     # the viewer can see true throughput. Default mimics a 30 fps camera.
     src_throttle = False if uncapped_source else source_fps
-    source = FrameSource("assets/test.mp4", slots["rgb"],
+    source = FrameSource(source_path, slots["rgb"],
                          throttle_fps=src_throttle, resize=RESIZE)
     matter_worker = MatterWorker(slots["depth"], slots["flow"], slots["features"],
                                   slots["rgb"], slots["matter"],
@@ -1154,6 +1216,9 @@ def main(out_path="assets/streaming_demo.mp4", duration=10.0, fps=30,
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--out",       default="assets/streaming_demo.mp4")
+    p.add_argument("--source",    default="assets/test.mp4",
+                   help="Source video file (mp4/mov) or RGB-frames dir to stream "
+                        "through the live demo. Loops on EOF (real-time camera sim).")
     p.add_argument("--duration",  type=float, default=10.0)
     p.add_argument("--fps",       type=int,   default=30,
                    help="Recorder tick rate / output MP4 FPS.")
@@ -1165,7 +1230,8 @@ if __name__ == "__main__":
     p.add_argument("--config", default=None,
                    help="YAML hyperparameter config for MatterWorker "
                         "(default: configs/streaming_default.yaml; pass "
-                        "configs/streaming_tuned.yaml to use bayesopt output).")
+                        "configs/streaming_general.yaml for the multi-video "
+                        "live-calibrated config once it has been written).")
     p.add_argument("--sam-frame0", default="",
                    help="Cached SAM-frame-0 mask for semantic init (opt-in; only "
                         "used when tracking.use_sam_frame0 is also set). OFF by "
@@ -1176,4 +1242,5 @@ if __name__ == "__main__":
     args = p.parse_args()
     main(out_path=args.out, duration=args.duration, fps=args.fps,
          uncapped_source=args.uncapped_source, source_fps=args.source_fps,
-         config_path=args.config, sam_frame0_path=args.sam_frame0 or None)
+         config_path=args.config, sam_frame0_path=args.sam_frame0 or None,
+         source_path=args.source)

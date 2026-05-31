@@ -32,3 +32,4 @@ assets/videos_tmp/
 # Vendored externals: ship source only; weights via get_weights.sh / HF
 genmatterpp/external/**/.git/
 genmatterpp/external/**/checkpoints/
+assets/tapvid_davis_30_videos_processed/

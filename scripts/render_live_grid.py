@@ -270,9 +270,22 @@ def render_video(vid: str, out_path: Path, *, yaml_cfg: dict, num_sweeps: int,
     # (default 15 = vendored). ONE global value — no per-video knobs.
     blob_means_updates = int(_trk.get("blob_means_updates_per_frame",
                                       genmatter_rt._BLOB_MEANS_UPDATES_DEFAULT))
+    # ANTI-DRIFT feature update: legacy static freeze + the DAMPED generalization
+    # (feature_update_damping in [0,1]; <1 blends each per-frame Gibbs feature
+    # update back toward the frame-0 anchor captured below). Read from YAML so the
+    # emitted render config's LEARNED damping actually reaches the demo tracker
+    # (previously these never threaded through, so demos rendered vendored).
+    freeze_blob_features = bool(_trk.get("freeze_blob_features",
+                                         genmatter_rt._FREEZE_BLOB_FEATURES_DEFAULT))
+    _damp_raw = _trk.get("feature_update_damping", None)
+    feature_update_damping = float(_damp_raw) if _damp_raw is not None else None
+    use_damp = (feature_update_damping is not None) and (feature_update_damping < 1.0)
+    blob_feat_anchor = None
+    hb_feat_anchor = None
     _log(f"{vid}: src={Path(src).name} seed={seed_kind} num_blobs={nb} "
          f"feat_final={feat_final} final_outlier={final_outlier} freeze_hb={freeze_hb} "
-         f"blob_means_updates={blob_means_updates}")
+         f"blob_means_updates={blob_means_updates} freeze_blob_features={freeze_blob_features} "
+         f"feature_update_damping={feature_update_damping}")
 
     import jax
     raw_frames = sum(1 for _ in live.iter_frames(Path(src), max_frames))
@@ -333,11 +346,21 @@ def render_video(vid: str, out_path: Path, *, yaml_cfg: dict, num_sweeps: int,
             # Cache the pristine post-init frame-0 seed for instant re-seed at
             # every loop seam (see the is_seam branch above).
             seed_state = state
+            # Capture the frame-0 appearance anchor for the damped feature update
+            # (the seam re-seed restores seed_state, so this anchor stays valid).
+            if use_damp:
+                import jax.numpy as _jnp
+                blob_feat_anchor = _jnp.asarray(state.blobs_state.blob_features)
+                hb_feat_anchor = _jnp.asarray(state.hyperblobs_state.hyperblob_features)
         state, key = genmatter_rt.step_multi_sweep(
             state, positions, velocities, features, key, num_sweeps=num_sweeps,
             feature_aware_final=feat_final, final_outlier=final_outlier,
             freeze_hyperblob_assignment=freeze_hb,
-            blob_means_updates=blob_means_updates)
+            blob_means_updates=blob_means_updates,
+            freeze_blob_features=freeze_blob_features,
+            blob_feat_anchor=blob_feat_anchor,
+            hb_feat_anchor=hb_feat_anchor,
+            feature_update_damping=feature_update_damping)
         state.datapoints_state.blob_assignments.block_until_ready()
         blob_a, hyperblob_a = genmatter_rt.extract_assignments(state)
         t_gibbs = time.monotonic()

@@ -1,6 +1,6 @@
 # GenMatterPlusPlus
 
-Probabilistic 3D particle tracking for motion segmentation. This fork keeps **TAP-Vid DAVIS** paper benchmarks and adds a **custom MP4** workflow (`genmatter` CLI) for realtime preprocess, tracking, Rerun visualization, pseudo-GT, and Bayesian optimization.
+Probabilistic 3D particle tracking for motion segmentation. This fork keeps **TAP-Vid DAVIS** paper benchmarks and adds a **custom MP4** workflow (`genmatter` CLI) for realtime preprocess, tracking, Rerun visualization, and SAM2 pseudo-GT.
 
 ## Requirements
 
@@ -40,17 +40,13 @@ Preprocess runs four GPU stages sequentially: RGB frames → 3D motion (VDA + RA
 
 Tracking runs Gibbs initialization, temporal tracking (JIT-compiled, compile-once across videos), and dense evaluation. JAX compile time is reported separately from FPS.
 
-### Pseudo-GT + Bayesian optimization
+### Pseudo-GT (SAM2)
 
 ```bash
 uv run genmatter pseudo-gt --video-id <video_id>
-uv sync --extra bayesopt
-uv run genmatter bayesopt --video-id <video_id> \
-  --config configs/custom_default.yaml \
-  --bayesopt-config configs/custom_bayesopt.yaml
 ```
 
-See **[configs/custom_default.yaml](configs/custom_default.yaml)** and **[configs/custom_bayesopt.yaml](configs/custom_bayesopt.yaml)** for hyperparameters.
+See **[configs/custom_default.yaml](configs/custom_default.yaml)** for hyperparameters.
 
 ## TAP-Vid DAVIS benchmarks
 
@@ -68,7 +64,7 @@ Paths and constants: **`config.py`** (or `GENMATTER_DAVIS_DIR`, `GENMATTER_RESUL
 ## Tests
 
 ```bash
-uv sync --extra dev --extra bayesopt
+uv sync --extra dev
 uv run pytest
 ```
 

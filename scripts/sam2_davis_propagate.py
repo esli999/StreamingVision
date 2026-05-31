@@ -32,12 +32,127 @@ sys.path.insert(0, str(_REPO / "genmatterpp"))
 os.environ.setdefault("GENMATTER_DAVIS_DIR", str(_REPO / "assets"))
 
 import config as gm_config  # noqa: E402  — must come after env var set
+from genmatter.pseudo_gt import sam_video as _sam_video_mod  # noqa: E402 — monkeypatch target
 from genmatter.pseudo_gt.sam_video import segment_sequence  # noqa: E402
 from genmatter.pseudo_gt.correspondence import label_map_from_masks  # noqa: E402
 
 
 OUT_ROOT = _REPO / "assets" / "tapvid_davis_30_videos_processed" / "sam2_propagated"
 WEIGHTS_DIR = _REPO / "assets" / "deeplearning_weights"
+
+
+# ---------------------------------------------------------------------------
+# Self-supervised SALIENCE prior for SAM2 frame-0 object selection (Part 1).
+# The vendored `segment_sam2_video_tracked` ranks the frame-0 auto-mask bboxes by
+# AREA (`select_bboxes_by_area`) and keeps the largest `max_objects`. On
+# small-subject videos (kite-surf, libby, horsejump-high) the salient subject is
+# small → dropped → the propagated mask tracks the WRONG object (SAM-vs-GT frame-0
+# IoU = 0.000), capping the self-supervised region-J on exactly the low-GT videos
+# that drag the held-out aggregate. We replace area-ranking with a FIXED a-priori
+# salience score
+#     salience(bbox) = w_c * centrality + w_m * motion
+# both terms self-supervised and domain-agnostic (NOT per-video, NOT tuned to any
+# metric): the salient subject is central AND moving; static background (water,
+# sky) scores low. Implemented by MONKEYPATCHing the module symbol
+# `sam_video.select_bboxes_by_area` (no vendored edit — VENDORED.md); the patch
+# reads a per-video context (`_SALIENCE_CTX`) set in `propagate_one`, and on ANY
+# error falls back to the original area ranking (best-effort improvement only).
+# ---------------------------------------------------------------------------
+_SALIENCE_ORIG = _sam_video_mod.select_bboxes_by_area
+_SALIENCE_CTX: dict = {}
+
+
+def _farneback_motion_per_bbox(bboxes: np.ndarray) -> Optional[np.ndarray]:
+    """Mean optical-flow magnitude (frame 0→1) inside each xyxy bbox.
+
+    Returns None when the second frame / flow is unavailable so the caller falls
+    back to centrality only. cv2.calcOpticalFlowFarneback — no GPU / model needed.
+    """
+    f0 = _SALIENCE_CTX.get("frame0")
+    f1 = _SALIENCE_CTX.get("frame1")
+    if f0 is None or f1 is None:
+        return None
+    g0 = cv2.imread(str(f0), cv2.IMREAD_GRAYSCALE)
+    g1 = cv2.imread(str(f1), cv2.IMREAD_GRAYSCALE)
+    if g0 is None or g1 is None or g0.shape != g1.shape:
+        return None
+    flow = cv2.calcOpticalFlowFarneback(g0, g1, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+    mag = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2)
+    H, W = mag.shape
+    out = np.zeros(len(bboxes), dtype=np.float64)
+    for i, b in enumerate(bboxes):
+        xi0 = max(0, int(np.floor(b[0]))); yi0 = max(0, int(np.floor(b[1])))
+        xi1 = min(W, int(np.ceil(b[2])));  yi1 = min(H, int(np.ceil(b[3])))
+        if xi1 > xi0 and yi1 > yi0:
+            out[i] = float(mag[yi0:yi1, xi0:xi1].mean())
+    return out
+
+
+def _centrality_per_bbox(bboxes: np.ndarray) -> np.ndarray:
+    """1 - ||bbox_center - frame_center|| / half_diagonal, clipped to [0, 1]."""
+    hw = _SALIENCE_CTX.get("native_hw")
+    if hw is not None:
+        H, W = float(hw[0]), float(hw[1])
+    else:  # frame size unknown → approximate from the bbox extent
+        W = float(bboxes[:, 2].max()); H = float(bboxes[:, 3].max())
+    cx, cy = W / 2.0, H / 2.0
+    half_diag = 0.5 * float(np.hypot(W, H)) + 1e-6
+    bx = 0.5 * (bboxes[:, 0] + bboxes[:, 2])
+    by = 0.5 * (bboxes[:, 1] + bboxes[:, 3])
+    dist = np.hypot(bx - cx, by - cy)
+    return np.clip(1.0 - dist / half_diag, 0.0, 1.0)
+
+
+def _select_bboxes_salient(bboxes: np.ndarray, max_objects):
+    """Salience-ranked replacement for `select_bboxes_by_area` (monkeypatched).
+
+    Keeps the top-`max_objects` bboxes by `w_c*centrality + w_m*motion`. Identical
+    contract to the original: returns all boxes unchanged when `max_objects is None`
+    or `len(bboxes) <= max_objects`. Any failure falls back to the area ranking.
+    """
+    try:
+        bboxes = np.asarray(bboxes)
+        if max_objects is None or len(bboxes) <= int(max_objects):
+            return bboxes
+        w_c = float(_SALIENCE_CTX.get("w_c", 0.5))
+        w_m = float(_SALIENCE_CTX.get("w_m", 0.5))
+        centrality = _centrality_per_bbox(bboxes)
+        motion = _farneback_motion_per_bbox(bboxes)
+        if motion is None or float(np.ptp(motion)) < 1e-9:
+            motion_norm = np.zeros(len(bboxes), dtype=np.float64)
+            w_m = 0.0  # no usable motion signal → centrality only
+        else:
+            p90 = float(np.percentile(motion, 90)) + 1e-9
+            motion_norm = np.clip(motion / p90, 0.0, 1.0)
+        denom = (w_c + w_m) or 1.0
+        score = (w_c * centrality + w_m * motion_norm) / denom
+        keep = np.sort(np.argsort(score)[-int(max_objects):])  # top-K, frame-0 order
+        return bboxes[keep]
+    except Exception:  # never let salience break a regen — fall back to area
+        return _SALIENCE_ORIG(bboxes, max_objects)
+
+
+def _apply_salience_context(rgb_dir: Path, salience: bool,
+                            salience_weights: tuple) -> str:
+    """Set the per-video salience context and (de)activate the monkeypatch.
+
+    Returns the active selection mode ("salience" | "area") for logging.
+    """
+    if not salience:
+        _sam_video_mod.select_bboxes_by_area = _SALIENCE_ORIG
+        return "area"
+    frames = sorted(rgb_dir.glob("*.jpg")) + sorted(rgb_dir.glob("*.png"))
+    bgr0 = cv2.imread(str(frames[0])) if frames else None
+    _SALIENCE_CTX.clear()
+    _SALIENCE_CTX.update({
+        "frame0": frames[0] if frames else None,
+        "frame1": frames[1] if len(frames) > 1 else None,
+        "native_hw": (bgr0.shape[0], bgr0.shape[1]) if bgr0 is not None else None,
+        "w_c": float(salience_weights[0]),
+        "w_m": float(salience_weights[1]),
+    })
+    _sam_video_mod.select_bboxes_by_area = _select_bboxes_salient
+    return "salience"
 
 
 def _save_label_maps(out_dir: Path, per_frame: List[List[np.ndarray]],
@@ -84,7 +199,9 @@ def _backup_existing(out_dir: Path) -> Optional[Path]:
 def propagate_one(vid: str, *, force: bool = False, backup: bool = False,
                   model: str = "sam2.1_l.pt", min_threshold: float = 0.08,
                   max_objects: int = 20, video_imgsz: int = 1024,
-                  video_chunk_frames: int = 16, iou_threshold: float = 0.3) -> dict:
+                  video_chunk_frames: int = 16, iou_threshold: float = 0.3,
+                  salience: bool = False,
+                  salience_weights: tuple = (0.5, 0.5)) -> dict:
     info = {"vid": vid}
     rgb_dir = Path(gm_config.DAVIS_RGB_PATH) / vid
     out_dir = OUT_ROOT / vid
@@ -103,6 +220,10 @@ def propagate_one(vid: str, *, force: bool = False, backup: bool = False,
         bk = _backup_existing(out_dir)
         if bk is not None:
             info["backup_dir"] = str(bk)
+
+    # Part 1: activate the self-supervised salience prior (centrality + motion) in
+    # place of area-ranking for frame-0 object selection (monkeypatch, reversible).
+    info["select"] = _apply_salience_context(rgb_dir, salience, salience_weights)
 
     t0 = time.monotonic()
     # Higher-quality kwargs (the plan, Phase E): lower min_threshold (more recall),
@@ -154,6 +275,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="SAM2 video propagation image size (raise for more detail, more VRAM).")
     p.add_argument("--video-chunk-frames", type=int, default=16)
     p.add_argument("--iou-threshold", type=float, default=0.3)
+    # Self-supervised salience prior for frame-0 object selection. OPT-IN: the
+    # offline prototype (scripts/_salience_filter_proto.py) showed a salience
+    # rerank/threshold is not a robust, generalizing win (no global tau is safe;
+    # it helps some videos and collapses others), so the script DEFAULT keeps the
+    # vendored area ranking (the known-good pseudo-labels). --salience is retained
+    # for experiments; weights are FIXED a-priori (not tuned to any metric).
+    p.add_argument("--salience", action="store_true",
+                   help="Enable the centrality+motion salience prior for frame-0 selection (experimental).")
+    p.add_argument("--salience-centrality-weight", type=float, default=0.5,
+                   help="A-priori weight on bbox centrality (default 0.5).")
+    p.add_argument("--salience-motion-weight", type=float, default=0.5,
+                   help="A-priori weight on bbox optical-flow motion (default 0.5).")
     args = p.parse_args(argv)
 
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
@@ -163,9 +296,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         wanted = set(v.strip() for v in args.videos.split(","))
         expected = [v for v in expected if v in wanted]
 
+    sel = (f"salience(c={args.salience_centrality_weight},m={args.salience_motion_weight})"
+           if args.salience else "area")
     print(f"[sam2_davis_propagate] running on {len(expected)} video(s); out={OUT_ROOT}; "
           f"min_threshold={args.min_threshold} max_objects={args.max_objects} "
-          f"video_imgsz={args.video_imgsz} backup={args.backup}", flush=True)
+          f"video_imgsz={args.video_imgsz} backup={args.backup} select={sel}", flush=True)
     total_sec = 0.0
     n_done = 0
     for i, vid in enumerate(expected, 1):
@@ -174,10 +309,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                              min_threshold=args.min_threshold, max_objects=args.max_objects,
                              video_imgsz=args.video_imgsz,
                              video_chunk_frames=args.video_chunk_frames,
-                             iou_threshold=args.iou_threshold)
+                             iou_threshold=args.iou_threshold,
+                             salience=args.salience,
+                             salience_weights=(args.salience_centrality_weight,
+                                               args.salience_motion_weight))
         if info["status"] == "ok":
             print(f"  ok: {info['frames']} frames ({info.get('n_objects', '?')} objs) in "
                   f"{info['wall_sec']:.1f}s ({info['sec_per_frame']:.2f}s/frame) @ {info['native_hw']}"
+                  f" [select={info.get('select', '?')}]"
                   + (f" [backed up → {info['backup_dir']}]" if info.get("backup_dir") else ""),
                   flush=True)
             total_sec += info["wall_sec"]

@@ -316,6 +316,15 @@ INFER_FINAL_OUTLIER = False        # no outlier injection on the final assignmen
 INFER_FREEZE_HYPERBLOB = True      # keep the frame-0 seeded blob->hyperblob map (THE fix)
 INFER_PURE_OBJECT_SEED = True      # rebuild CHM so each object hyperblob is pure at frame 0
 INFER_BLOB_MEANS_UPDATES = 15      # per-frame gibbs_blob_means refinement count (one global)
+# Anti-drift feature update (Phase A re-optimization). feature_update_damping in
+# [0, 1] blends each per-frame Gibbs DINO-feature update back toward the frame-0
+# anchor (d=0 == freeze the appearance, d=1 == vendored pure-Gibbs). This is the
+# DAMPED generalization of the freeze_blob_features fix; it is SELECTED on TRAIN in
+# phase_select and learned-under in phase_em. 1.0 here keeps the default bit-exact;
+# the legacy static freeze flag is kept for back-compat (off by default — damping
+# supersedes it).
+INFER_FREEZE_BLOB_FEATURES = False
+INFER_FEATURE_UPDATE_DAMPING = 1.0
 
 OUT_ROOT = _REPO_ROOT / "runs" / "calibrate_consistency"
 LABELS_DIR = OUT_ROOT / "labels"
@@ -486,7 +495,9 @@ def _infer_cfg(*, use_sam_frame0: bool, num_blobs: int, num_hyperblobs: int,
                final_outlier: bool = INFER_FINAL_OUTLIER,
                freeze_hyperblob: bool = INFER_FREEZE_HYPERBLOB,
                pure_object_seed: bool = INFER_PURE_OBJECT_SEED,
-               blob_means_updates: int = INFER_BLOB_MEANS_UPDATES) -> dict:
+               blob_means_updates: int = INFER_BLOB_MEANS_UPDATES,
+               freeze_blob_features: bool = INFER_FREEZE_BLOB_FEATURES,
+               feature_update_damping: float = INFER_FEATURE_UPDATE_DAMPING) -> dict:
     """Bundle the inference-strategy + architectural-structure knobs threaded into
     _make_yaml_cfg + the tracker. ONE global config — the same dict drives EM,
     accept-test, validate (chosen pass), and the emitted YAML.
@@ -504,7 +515,9 @@ def _infer_cfg(*, use_sam_frame0: bool, num_blobs: int, num_hyperblobs: int,
             "final_outlier": bool(final_outlier),
             "freeze_hyperblob": bool(freeze_hyperblob),
             "pure_object_seed": bool(pure_object_seed),
-            "blob_means_updates": int(blob_means_updates)}
+            "blob_means_updates": int(blob_means_updates),
+            "freeze_blob_features": bool(freeze_blob_features),
+            "feature_update_damping": float(feature_update_damping)}
 
 
 # Inference config for the SHIPPING baseline (validate's honest "before"): the
@@ -1100,6 +1113,14 @@ def _make_yaml_cfg(em: EmState, infer: dict) -> dict:
         infer.get("pure_object_seed", INFER_PURE_OBJECT_SEED))
     cfg["tracking"]["blob_means_updates_per_frame"] = int(
         infer.get("blob_means_updates", INFER_BLOB_MEANS_UPDATES))
+    # Anti-drift feature update (Phase A): the DAMPED generalization of the freeze
+    # fix. Written into EVERY _make_yaml_cfg output so the EM learns the hypers
+    # UNDER the damped inference, selection sweeps it, and the emitted YAML ships
+    # the LEARNED value. d=1.0 is bit-exact vendored; legacy freeze flag kept off.
+    cfg["tracking"]["freeze_blob_features"] = bool(
+        infer.get("freeze_blob_features", INFER_FREEZE_BLOB_FEATURES))
+    cfg["tracking"]["feature_update_damping"] = float(
+        infer.get("feature_update_damping", INFER_FEATURE_UPDATE_DAMPING))
     cfg["tracking"]["calibrate_feature_sigmas"] = False
     cfg["tracking"]["use_calibrated_priors"] = bool(em.use_calibrated_priors)
     hp = cfg["tracking"]["hyperparams"]
@@ -1130,7 +1151,8 @@ def _make_yaml_cfg(em: EmState, infer: dict) -> dict:
 def _run_tracker_on_video(labels_TN: dict, yaml_cfg: dict, max_frames: int, *,
                            num_sweeps: int = 1,
                            capture_blob_weights: bool = False,
-                           sam_grid: Optional[np.ndarray] = None) -> dict:
+                           sam_grid: Optional[np.ndarray] = None,
+                           capture_data_loglik: bool = False) -> dict:
     """Run the Gibbs tracker over a video's CACHED perception outputs (the
     positions/velocities/features stored in its pseudo-label .npz) — no
     depth/flow/DINO recompute, since perception is invariant to the calibration
@@ -1151,7 +1173,7 @@ def _run_tracker_on_video(labels_TN: dict, yaml_cfg: dict, max_frames: int, *,
         return genmatter_rt.run_tracker_from_cache(
             pos, vel, feat, idx, yaml_cfg=yaml_cfg, num_blobs=nb, num_hyperblobs=nh,
             num_sweeps=num_sweeps, capture_blob_weights=capture_blob_weights,
-            sam_segmentation=sam_grid)
+            sam_segmentation=sam_grid, capture_data_loglik=capture_data_loglik)
     except Exception as e:
         return {"error": repr(e)}
 
@@ -1367,11 +1389,21 @@ COMPOSITE_WEIGHTS: Dict[str, float] = {
 }
 
 # The self-supervised objective the EM / accept-test / selection optimize:
-# "composite" (default) | "region_J" (the binary kill-switch fallback). The
-# held-out GT gate is ALWAYS binary region-J regardless of this. Set via
-# main()'s --objective flag (the operator reverts to "region_J" if the validate
-# corr(composite, GT) diagnostic comes back non-positive).
+# "composite" (default) | "data_loglik" (Phase-B probabilistic complete-data
+# log-likelihood) | "region_J" (the binary kill-switch fallback). The held-out GT
+# gate is ALWAYS binary region-J regardless of this. Set via main()'s --objective
+# flag. data_loglik is the Phase-B re-optimization objective (replaces the
+# anti-correlated region-J-vs-union signal with the model's OWN likelihood, which a
+# bleeding tracker scores LOWER on); it is gated by _loglik_objective_proto.py
+# before use, and the operator reverts to composite/region_J if that gate fails.
 _OBJECTIVE_MODE = "composite"
+# When _OBJECTIVE_MODE == "data_loglik", which term decomposition from
+# _data_loglik.frame_data_loglik_terms drives selection (the Phase-B proto picks
+# the best GT-correlating variant). The NAIVE live-feature variants ("full",
+# "pos_feat") reward feature DRIFT (anti-correlate with GT); the ANCHOR-referenced
+# variants ("feat_anchor", "anchor_pos_feat", "anchor_full") score features vs the
+# FROZEN frame-0 appearance and TRACK GT. Default = anchor_pos_feat.
+_DATA_LOGLIK_VARIANT = "anchor_pos_feat"
 
 
 def _instance_matched_J(hb_a_TN: np.ndarray, z_sam_TN: np.ndarray, Tc: int,
@@ -1460,14 +1492,37 @@ def _score_video_composite(vid: str, hb_a_TN: np.ndarray, blob_a_TN: np.ndarray,
     return comps
 
 
+def _pick_data_loglik(tr: dict) -> Optional[float]:
+    """Select the configured data-loglik VARIANT (_DATA_LOGLIK_VARIANT) from a
+    tracker result's captured term breakdown. Falls back to the headline scalar.
+    Returns None when the tracker didn't capture loglik (objective != data_loglik)."""
+    terms = tr.get("data_loglik_terms")
+    if terms is not None:
+        return terms.get(_DATA_LOGLIK_VARIANT, tr.get("data_loglik"))
+    return tr.get("data_loglik")
+
+
 def _self_sup_score(vid: str, hb_a_TN: np.ndarray, blob_a_TN: np.ndarray,
-                    indices_N: np.ndarray, labels: dict) -> dict:
+                    indices_N: np.ndarray, labels: dict,
+                    data_loglik: Optional[float] = None) -> dict:
     """The self-supervised score the EM / accept-test / selection optimize.
-    Returns the full composite dict plus ``score`` = composite or binary region_J
-    per _OBJECTIVE_MODE (the kill-switch). GT is never touched here."""
+    Returns the full composite dict plus ``score`` per _OBJECTIVE_MODE:
+      composite   -> the fixed-weight region-J composite (default),
+      data_loglik -> the model's complete-data log-likelihood (Phase B; passed in
+                     from the tracker run since it needs the live state, NOT the
+                     assignments), higher = better, comparable across videos,
+      region_J    -> binary CLUSTER region-J vs Z_sam>0 (the kill-switch fallback).
+    The composite components are ALWAYS computed (logging + kill-switch corr). GT is
+    never touched here."""
     comp = _score_video_composite(vid, hb_a_TN, blob_a_TN, indices_N, labels)
-    comp["score"] = (comp["composite"] if _OBJECTIVE_MODE == "composite"
-                     else comp["region_J"])
+    if _OBJECTIVE_MODE == "data_loglik":
+        comp["data_loglik"] = (float(data_loglik) if data_loglik is not None
+                               and np.isfinite(data_loglik) else float("nan"))
+        comp["score"] = comp["data_loglik"]
+    elif _OBJECTIVE_MODE == "composite":
+        comp["score"] = comp["composite"]
+    else:
+        comp["score"] = comp["region_J"]
     return comp
 
 
@@ -1643,7 +1698,9 @@ def phase_em(out_root: Path, *, force: bool = False,
               final_outlier: bool = INFER_FINAL_OUTLIER,
               freeze_hyperblob: bool = INFER_FREEZE_HYPERBLOB,
               pure_object_seed: bool = INFER_PURE_OBJECT_SEED,
-              blob_means_updates: int = INFER_BLOB_MEANS_UPDATES) -> dict:
+              blob_means_updates: int = INFER_BLOB_MEANS_UPDATES,
+              freeze_blob_features: bool = INFER_FREEZE_BLOB_FEATURES,
+              feature_update_damping: float = INFER_FEATURE_UPDATE_DAMPING) -> dict:
     """Outer EM loop: run the deep-N-sweep tracker → MAP-posterior M-step → veto →
     damp → per-group composite-J accept-test → repeat.
 
@@ -1677,7 +1734,9 @@ def phase_em(out_root: Path, *, force: bool = False,
                        num_hyperblobs=num_hyperblobs, init_gibbs_sweeps=init_gibbs_sweeps,
                        feature_aware_final=feature_aware_final, final_outlier=final_outlier,
                        freeze_hyperblob=freeze_hyperblob, pure_object_seed=pure_object_seed,
-                       blob_means_updates=blob_means_updates)
+                       blob_means_updates=blob_means_updates,
+                       freeze_blob_features=freeze_blob_features,
+                       feature_update_damping=feature_update_damping)
     # TRAIN-split restriction: learning (main pass + M-step + accept-test) sees
     # ONLY train_videos; held-out + GT are reserved for phase_validate. None =
     # legacy all-cached behaviour.
@@ -1758,7 +1817,8 @@ def phase_em(out_root: Path, *, force: bool = False,
             tr = _run_tracker_on_video(labels_cache[vid], yaml_cfg, max_frames_per_video,
                                        num_sweeps=num_gibbs_sweeps_per_frame,
                                        capture_blob_weights=True,
-                                       sam_grid=sam_grids.get(vid))
+                                       sam_grid=sam_grids.get(vid),
+                                       capture_data_loglik=(_OBJECTIVE_MODE == "data_loglik"))
             if "error" in tr:
                 tracker_errors[vid] = tr["error"]
                 _log(f"em iter {iter_t} [{j}/{len(labels_cache)}] {vid}: tracker FAILED")
@@ -1780,7 +1840,8 @@ def phase_em(out_root: Path, *, force: bool = False,
             # motion-ARI + blob-J vs cached Z_sam), NO ground truth. region_J is
             # kept alongside (logging + the kill-switch fallback objective).
             cs = _self_sup_score(vid, tr["hyperblob_a"], tr["blob_a"], tr.get("indices"),
-                                 labels_cache[vid])
+                                 labels_cache[vid],
+                                 data_loglik=_pick_data_loglik(tr))
             per_vid_score[vid] = {**cs, "kind": entry.kind,
                                   "matter_fps": tr["matter_fps"],
                                   "outlier_frac_p95": tr["outlier_frac_p95"],
@@ -1947,11 +2008,12 @@ def _score_subset_J(em: EmState, labels_cache: Dict[str, dict],
             continue
         tr = _run_tracker_on_video(labels_cache[vid], yaml_cfg, max_frames,
                                    num_sweeps=num_sweeps, capture_blob_weights=True,
-                                   sam_grid=sam_grids.get(vid))
+                                   sam_grid=sam_grids.get(vid),
+                                   capture_data_loglik=(_OBJECTIVE_MODE == "data_loglik"))
         if "error" in tr:
             continue
         sc = _self_sup_score(vid, tr["hyperblob_a"], tr["blob_a"], tr.get("indices"),
-                             labels_cache[vid])
+                             labels_cache[vid], data_loglik=_pick_data_loglik(tr))
         if np.isfinite(sc["score"]):
             per_vid_J[vid] = float(sc["score"])
     if not per_vid_J:
@@ -2090,6 +2152,10 @@ def phase_select(out_root: Path, *, force: bool = False,
     # (the finite seed). blob_means_updates is the crude per-frame anti-bleed proxy.
     grid.setdefault("sigma_V", [_SIGMA_V_SEED])
     grid.setdefault("blob_means_updates", [INFER_BLOB_MEANS_UPDATES])
+    # Phase-A anti-drift damping axis: default a SINGLE value (no explosion).
+    # Pass e.g. [0.0, 0.25, 0.5, 1.0] to SELECT the damping self-supervised on
+    # TRAIN (scored by the Phase-B data_loglik objective on SELECT_VAL).
+    grid.setdefault("feature_update_damping", [INFER_FEATURE_UPDATE_DAMPING])
     if base_infer_kwargs is None:
         base_infer_kwargs = dict(use_sam_frame0=INFER_USE_SAM_FRAME0,
                                  num_hyperblobs=INFER_NUM_HYPERBLOBS,
@@ -2115,27 +2181,31 @@ def phase_select(out_root: Path, *, force: bool = False,
          f"videos (self-supervised COMPOSITE, reference=sam); short EM on TRAIN "
          f"({len(TRAIN_VIDEOS)} videos), {em_iters} iters/combo")
 
-    # Combo = (num_blobs, init_gibbs_sweeps, per_frame_sweeps, sigma_V, blob_means_updates).
+    # Combo = (num_blobs, init_gibbs_sweeps, per_frame_sweeps, sigma_V,
+    #          blob_means_updates, feature_update_damping).
     combos = list(itertools.product(
         grid["num_blobs"], grid["init_gibbs_sweeps"], grid["num_gibbs_sweeps_per_frame"],
-        grid["sigma_V"], grid["blob_means_updates"]))
+        grid["sigma_V"], grid["blob_means_updates"], grid["feature_update_damping"]))
     _log(f"select: {len(combos)} grid combos "
          f"(num_blobs={grid['num_blobs']} init_gibbs_sweeps={grid['init_gibbs_sweeps']} "
          f"per_frame_sweeps={grid['num_gibbs_sweeps_per_frame']} "
-         f"sigma_V={grid['sigma_V']} blob_means_updates={grid['blob_means_updates']})")
+         f"sigma_V={grid['sigma_V']} blob_means_updates={grid['blob_means_updates']} "
+         f"feature_update_damping={grid['feature_update_damping']})")
 
-    for ci, (nb, igs, nsw, sv, bmu) in enumerate(combos, 1):
-        combo_key = (nb, igs, nsw, float(sv), bmu)
+    for ci, (nb, igs, nsw, sv, bmu, fud) in enumerate(combos, 1):
+        combo_key = (nb, igs, nsw, float(sv), bmu, float(fud))
         sv_tag = f"{float(sv):g}".replace("+", "")
-        label = f"nb{nb}/igs{igs}/sw{nsw}/sv{sv_tag}/bmu{bmu}"
+        fud_tag = f"{float(fud):g}"
+        label = f"nb{nb}/igs{igs}/sw{nsw}/sv{sv_tag}/bmu{bmu}/fud{fud_tag}"
         if combo_key in done:
             _log(f"select [{ci}/{len(combos)}] {label}: cached, skip")
             continue
         t0 = time.monotonic()
-        combo_root = out_root / "select" / f"nb{nb}_igs{igs}_sw{nsw}_sv{sv_tag}_bmu{bmu}"
+        combo_root = out_root / "select" / f"nb{nb}_igs{igs}_sw{nsw}_sv{sv_tag}_bmu{bmu}_fud{fud_tag}"
         combo_root.mkdir(parents=True, exist_ok=True)
         combo_infer_kwargs = {**base_infer_kwargs, "num_blobs": nb,
-                              "init_gibbs_sweeps": igs, "blob_means_updates": bmu}
+                              "init_gibbs_sweeps": igs, "blob_means_updates": bmu,
+                              "feature_update_damping": float(fud)}
         # Short EM on TRAIN under this inference combo (resumable: phase_em caches
         # combo_root/em.json and returns it on re-entry unless force). The short EM
         # does NOT use the Phase-D val loop (em_val_videos=None) so SELECT_VAL stays
@@ -2157,11 +2227,12 @@ def phase_select(out_root: Path, *, force: bool = False,
         for vid in labels_cache:
             tr = _run_tracker_on_video(labels_cache[vid], yaml_cfg, max_frames_per_video,
                                        num_sweeps=nsw, capture_blob_weights=True,
-                                       sam_grid=sam_grids.get(vid))
+                                       sam_grid=sam_grids.get(vid),
+                                       capture_data_loglik=(_OBJECTIVE_MODE == "data_loglik"))
             if "error" in tr:
                 continue
             sc = _self_sup_score(vid, tr["hyperblob_a"], tr["blob_a"], tr.get("indices"),
-                                 labels_cache[vid])
+                                 labels_cache[vid], data_loglik=_pick_data_loglik(tr))
             if np.isfinite(sc["score"]):
                 per_vid_score[vid] = float(sc["score"])
             if np.isfinite(sc["region_J"]):
@@ -2172,11 +2243,11 @@ def phase_select(out_root: Path, *, force: bool = False,
         median_score = float(np.median(list(per_vid_score.values()))) if per_vid_score else float("nan")
         median_regionJ = float(np.median(list(per_vid_regionJ.values()))) if per_vid_regionJ else float("nan")
         median_p95 = float(np.median(p95s)) if p95s else float("nan")
-        rec = {"combo": [nb, igs, nsw, float(sv), bmu],
+        rec = {"combo": [nb, igs, nsw, float(sv), bmu, float(fud)],
                "num_blobs": nb, "init_gibbs_sweeps": igs,
                "num_gibbs_sweeps_per_frame": nsw, "sigma_V": float(sv),
-               "blob_means_updates": bmu,
-               "select_val_score": median_score,         # composite (the objective)
+               "blob_means_updates": bmu, "feature_update_damping": float(fud),
+               "select_val_score": median_score,         # objective (composite | data_loglik)
                "select_val_region_J": median_regionJ,    # binary region-J (display/diag)
                "select_val_median_p95": median_p95,
                "best_train_score": em_info.get("best_composite"),
@@ -2204,6 +2275,7 @@ def phase_select(out_root: Path, *, force: bool = False,
         -round(float(c["select_val_score"]), 4),
         int(c["combo"][0]), int(c["combo"][2]), int(c["combo"][1]),
         -float(_combo_at(c, 3, _SIGMA_V_SEED)), int(_combo_at(c, 4, INFER_BLOB_MEANS_UPDATES)),
+        -float(_combo_at(c, 5, INFER_FEATURE_UPDATE_DAMPING)),   # prefer LARGER damping (less intervention) on ties
         float(c.get("select_val_median_p95") if np.isfinite(
             c.get("select_val_median_p95", float("nan"))) else 1e9),
     ))[0]
@@ -2213,6 +2285,7 @@ def phase_select(out_root: Path, *, force: bool = False,
         "num_gibbs_sweeps_per_frame": int(best["combo"][2]),
         "sigma_V_seed": float(_combo_at(best, 3, _SIGMA_V_SEED)),
         "blob_means_updates": int(_combo_at(best, 4, INFER_BLOB_MEANS_UPDATES)),
+        "feature_update_damping": float(_combo_at(best, 5, INFER_FEATURE_UPDATE_DAMPING)),
         "select_val_score": float(best["select_val_score"]),
         "select_val_region_J": float(best.get("select_val_region_J", float("nan"))),
         "select_val_median_p95": float(best.get("select_val_median_p95", float("nan"))),
@@ -2278,6 +2351,9 @@ def _infer_from_yaml_cfg(cfg: dict) -> dict:
         freeze_hyperblob=bool(trk.get("freeze_hyperblob_assignment", False)),
         pure_object_seed=bool(trk.get("pure_object_seed", False)),
         blob_means_updates=int(trk.get("blob_means_updates_per_frame", 15)),
+        freeze_blob_features=bool(trk.get("freeze_blob_features", False)),
+        feature_update_damping=float(trk.get("feature_update_damping",
+                                             INFER_FEATURE_UPDATE_DAMPING)),
     )
 
 
@@ -2318,7 +2394,9 @@ def phase_validate(out_root: Path, *, force: bool = False,
                     final_outlier: bool = INFER_FINAL_OUTLIER,
                     freeze_hyperblob: bool = INFER_FREEZE_HYPERBLOB,
                     pure_object_seed: bool = INFER_PURE_OBJECT_SEED,
-                    blob_means_updates: int = INFER_BLOB_MEANS_UPDATES) -> dict:
+                    blob_means_updates: int = INFER_BLOB_MEANS_UPDATES,
+                    freeze_blob_features: bool = INFER_FREEZE_BLOB_FEATURES,
+                    feature_update_damping: float = INFER_FEATURE_UPDATE_DAMPING) -> dict:
     """Generalization gate on the HELD-OUT split — the ONLY place true DAVIS GT
     is read. Learning + selection (phase_em / phase_select) never saw these
     videos; all 5 demo videos are here, so their quality measures generalization.
@@ -2356,7 +2434,9 @@ def phase_validate(out_root: Path, *, force: bool = False,
                               final_outlier=final_outlier,
                               freeze_hyperblob=freeze_hyperblob,
                               pure_object_seed=pure_object_seed,
-                              blob_means_updates=blob_means_updates)
+                              blob_means_updates=blob_means_updates,
+                              freeze_blob_features=freeze_blob_features,
+                              feature_update_damping=feature_update_damping)
     # Baseline = the currently-shipping streaming_general.yaml (or inline
     # streaming_default fallback). Captured BEFORE this run's emit overwrites it.
     baseline, baseline_infer, baseline_src = _load_shipping_baseline()
@@ -2391,13 +2471,19 @@ def phase_validate(out_root: Path, *, force: bool = False,
             is_davis = (entry.kind == "davis")
             tr = _run_tracker_on_video(labels_cache[vid], yaml_cfg, max_frames_per_video,
                                        num_sweeps=num_sweeps, capture_blob_weights=True,
-                                       sam_grid=sam_grids.get(vid))
+                                       sam_grid=sam_grids.get(vid),
+                                       capture_data_loglik=(_OBJECTIVE_MODE == "data_loglik"))
             if "error" in tr:
                 out[vid] = {"error": tr["error"], "kind": entry.kind}
                 _log(f"validate[{label}][{j}/{len(vids)}] {vid}: FAILED")
                 continue
             rec: dict = {"kind": entry.kind, "matter_fps": tr["matter_fps"],
                          "outlier_frac_p95": tr["outlier_frac_p95"]}
+            # Phase-B probabilistic objective value (self-supervised) — captured
+            # for the corr(data_loglik, GT) kill-switch below (held-out DAVIS only).
+            if _OBJECTIVE_MODE == "data_loglik":
+                rec["data_loglik"] = _pick_data_loglik(tr)
+                rec["data_loglik_terms"] = tr.get("data_loglik_terms")
             # Self-supervised REAL region-J (CLUSTER IoU vs Z_sam>0) — the EM
             # objective metric, logged here for every video.
             sam_rj = _score_video_region_J(vid, tr["hyperblob_a"], tr.get("indices"),
@@ -2518,13 +2604,18 @@ def phase_validate(out_root: Path, *, force: bool = False,
 
     comp_xs: List[float] = []
     regionj_xs: List[float] = []
+    loglik_xs: List[float] = []
     gt_ys: List[float] = []
+    loglik_ys: List[float] = []   # GT paired with the (possibly fewer) finite loglik points
     for vid, c in chosen_pv.items():
         if c.get("kind") != "davis":
             continue
         gj = c.get("gt_J"); cs = c.get("composite_sam"); rj = c.get("sam2_region_J")
         if all(v is not None and np.isfinite(v) for v in (gj, cs, rj)):
             gt_ys.append(float(gj)); comp_xs.append(float(cs)); regionj_xs.append(float(rj))
+        ll = c.get("data_loglik")
+        if gj is not None and np.isfinite(gj) and ll is not None and np.isfinite(ll):
+            loglik_xs.append(float(ll)); loglik_ys.append(float(gj))
     composite_gt = {
         "pearson": _pearson(comp_xs, gt_ys), "spearman": _spearman(comp_xs, gt_ys),
         "n": len(gt_ys), "objective_mode": _OBJECTIVE_MODE,
@@ -2532,10 +2623,18 @@ def phase_validate(out_root: Path, *, force: bool = False,
     region_gt = {
         "pearson": _pearson(regionj_xs, gt_ys), "spearman": _spearman(regionj_xs, gt_ys),
     }
-    # Kill-switch verdict: composite must not anti-correlate with GT. (Whether it
-    # BEATS binary region-J is reported for the operator; not auto-enforced.)
+    # Phase-B kill-switch: the PROBABILISTIC objective (data_loglik) must POSITIVELY
+    # correlate with held-out GT (it replaced the anti-correlated region-J-vs-union
+    # signal precisely to fix that). spearman >= 0 required when it is the objective.
+    data_loglik_gt = {
+        "pearson": _pearson(loglik_xs, loglik_ys), "spearman": _spearman(loglik_xs, loglik_ys),
+        "n": len(loglik_ys),
+    }
+    # Kill-switch verdict: the ACTIVE objective must not anti-correlate with GT.
     composite_ok = bool(_OBJECTIVE_MODE != "composite" or
                         (np.isfinite(composite_gt["spearman"]) and composite_gt["spearman"] >= 0.0))
+    loglik_ok = bool(_OBJECTIVE_MODE != "data_loglik" or
+                     (np.isfinite(data_loglik_gt["spearman"]) and data_loglik_gt["spearman"] >= 0.0))
 
     info: dict = {
         "phase": "validate",
@@ -2544,7 +2643,9 @@ def phase_validate(out_root: Path, *, force: bool = False,
         "composite_weights": dict(COMPOSITE_WEIGHTS),
         "composite_gt_corr": composite_gt,
         "region_J_gt_corr": region_gt,
+        "data_loglik_gt_corr": data_loglik_gt,
         "composite_kill_switch_ok": composite_ok,
+        "loglik_kill_switch_ok": loglik_ok,
         "chosen_infer": chosen_infer,
         "baseline_infer": baseline_infer,
         "baseline_source": baseline_src,
@@ -2584,6 +2685,12 @@ def phase_validate(out_root: Path, *, force: bool = False,
          f"(objective={_OBJECTIVE_MODE}; composite_ok={composite_ok}). "
          + ("" if composite_ok else
             "WARNING: composite ANTI-correlates with GT — re-run with --objective region_J."))
+    if _OBJECTIVE_MODE == "data_loglik":
+        _log(f"validate kill-switch: corr(data_loglik, GT) spearman="
+             f"{data_loglik_gt['spearman']:.3f}/pearson={data_loglik_gt['pearson']:.3f} "
+             f"(n={data_loglik_gt['n']}; loglik_ok={loglik_ok}). "
+             + ("" if loglik_ok else
+                "WARNING: data_loglik ANTI-correlates with GT — revert to --objective composite."))
     return info
 
 
@@ -2647,6 +2754,8 @@ def _emit_yaml(out_path: Path, *, val_info: dict, em_info: dict) -> None:
         f"#   translation_max_radius     = {chosen_em.translation_max_radius:.4f}",
         f"#   translation_gaussian_scale = {chosen_em.translation_gaussian_scale:.4f}",
         f"#   use_calibrated_priors      = {chosen_em.use_calibrated_priors}",
+        f"#   feature_update_damping     = {infer.get('feature_update_damping', INFER_FEATURE_UPDATE_DAMPING):.4f}  "
+        f"(Phase-A anti-drift; d=0 freeze .. d=1 vendored; SELECTED self-supervised)",
         "#",
         "# HELD-OUT validation (chosen = this config; baseline = previously-shipping):",
         f"#   real DAVIS GT region-J: chosen {chosen_gt:.4f} vs baseline {base_gt:.4f} "
@@ -3059,7 +3168,7 @@ def _run_with_retry(name: str, fn, *args, retries: int = 1, **kwargs):
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    global _OBJECTIVE_MODE   # set from --objective below (process-wide objective mode)
+    global _OBJECTIVE_MODE, _DATA_LOGLIK_VARIANT   # set from --objective / --data-loglik-variant below
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--phase", required=True,
                    choices=("preflight", "pseudo_labels", "select", "em", "validate",
@@ -3131,21 +3240,39 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--select-blob-means-updates", type=str,
                    default=f"{INFER_BLOB_MEANS_UPDATES}",
                    help="phase_select blob_means_updates grid (comma-separated).")
+    p.add_argument("--select-feature-update-damping", type=str,
+                   default=f"{INFER_FEATURE_UPDATE_DAMPING:g}",
+                   help="phase_select feature_update_damping grid (comma-separated). "
+                        "Pass e.g. '0.0,0.25,0.5,1.0' to SELECT the Phase-A anti-drift "
+                        "damping self-supervised on TRAIN (d=0 freeze .. d=1 vendored).")
     p.add_argument("--select-em-iters", type=int, default=2,
                    help="Short-EM iters per phase_select grid combo.")
     # ---- Self-supervised objective (the EM/accept/select score; the GT gate is
     # ALWAYS binary region-J regardless). 'composite' = the richer combination;
     # 'region_J' = the binary kill-switch fallback (revert here if validate reports
     # corr(composite, GT) <= 0). ----
-    p.add_argument("--objective", choices=("composite", "region_J"), default=_OBJECTIVE_MODE,
-                   help="Self-supervised EM/accept/select objective (default composite).")
+    p.add_argument("--objective", choices=("composite", "data_loglik", "region_J"),
+                   default=_OBJECTIVE_MODE,
+                   help="Self-supervised EM/accept/select objective. 'composite' (default) | "
+                        "'data_loglik' (Phase-B probabilistic complete-data log-likelihood; "
+                        "gate with _loglik_objective_proto.py first) | 'region_J' (binary "
+                        "kill-switch fallback). The held-out GT gate is always binary region-J.")
+    p.add_argument("--data-loglik-variant", type=str, default=_DATA_LOGLIK_VARIANT,
+                   help="When --objective data_loglik, which term decomposition drives "
+                        "selection (full | pos_feat | feat_only | feat | pos | vel | mix). "
+                        "The Phase-B proto picks the best GT-correlating variant.")
+    p.add_argument("--feature-update-damping", type=float, default=None,
+                   help="Override the em/validate Phase-A anti-drift damping (d=0 freeze .. "
+                        "d=1 vendored). Default: the phase_select-chosen value, else 1.0.")
     p.add_argument("--sigma-v-seed", type=float, default=None,
                    help="Override the EM initial sigma_V seed (the motion velocity-prior "
                         "variance). Default: DAVIS_DINO_DEFAULTS / the phase_select-chosen seed.")
     args = p.parse_args(argv)
 
-    # The self-supervised objective is a process-wide mode (mirrors _GT_SCORING_ALLOWED).
+    # The self-supervised objective + loglik variant are process-wide modes
+    # (mirror _GT_SCORING_ALLOWED).
     _OBJECTIVE_MODE = args.objective
+    _DATA_LOGLIK_VARIANT = args.data_loglik_variant
 
     out_root = Path(args.out).resolve()
     out_root.mkdir(parents=True, exist_ok=True)
@@ -3160,6 +3287,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                         freeze_hyperblob=args.freeze_hyperblob,
                         pure_object_seed=args.pure_object_seed,
                         blob_means_updates=args.blob_means_updates)
+    if args.feature_update_damping is not None:
+        infer_kwargs["feature_update_damping"] = float(args.feature_update_damping)
     num_sweeps = args.num_gibbs_sweeps_per_frame
     sigma_v_seed = args.sigma_v_seed   # None unless overridden / selected below
     # phase_select (if it ran) is AUTHORITATIVE for the global scalar tuple
@@ -3172,6 +3301,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         infer_kwargs["init_gibbs_sweeps"] = int(sel["init_gibbs_sweeps"])
         infer_kwargs["blob_means_updates"] = int(sel.get("blob_means_updates",
                                                           infer_kwargs["blob_means_updates"]))
+        if "feature_update_damping" in sel and args.feature_update_damping is None:
+            infer_kwargs["feature_update_damping"] = float(sel["feature_update_damping"])
         num_sweeps = int(sel["num_gibbs_sweeps_per_frame"])
         if sigma_v_seed is None and "sigma_V_seed" in sel:
             sigma_v_seed = float(sel["sigma_V_seed"])
@@ -3179,6 +3310,7 @@ def main(argv: Optional[List[str]] = None) -> int:
              f"init_gibbs_sweeps={infer_kwargs['init_gibbs_sweeps']} "
              f"per_frame_sweeps={num_sweeps} "
              f"blob_means_updates={infer_kwargs['blob_means_updates']} "
+             f"feature_update_damping={infer_kwargs.get('feature_update_damping', INFER_FEATURE_UPDATE_DAMPING)} "
              f"sigma_V_seed={sigma_v_seed} (self-supervised, TRAIN)")
 
     # render_all_local's signature takes only the original 4 inference knobs; the
@@ -3202,6 +3334,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         "num_gibbs_sweeps_per_frame": [int(x) for x in args.select_per_frame_sweeps.split(",") if x.strip()],
         "sigma_V": [float(x) for x in args.select_sigma_v.split(",") if x.strip()],
         "blob_means_updates": [int(x) for x in args.select_blob_means_updates.split(",") if x.strip()],
+        "feature_update_damping": [float(x) for x in
+                                   args.select_feature_update_damping.split(",") if x.strip()],
     }
 
     if args.phase == "preflight":
@@ -3265,6 +3399,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         infer_kwargs["init_gibbs_sweeps"] = int(sel["init_gibbs_sweeps"])
         infer_kwargs["blob_means_updates"] = int(sel.get("blob_means_updates",
                                                           infer_kwargs["blob_means_updates"]))
+        if "feature_update_damping" in sel and args.feature_update_damping is None:
+            infer_kwargs["feature_update_damping"] = float(sel["feature_update_damping"])
         num_sweeps = int(sel["num_gibbs_sweeps_per_frame"])
         if sigma_v_seed is None and "sigma_V_seed" in sel:
             sigma_v_seed = float(sel["sigma_V_seed"])

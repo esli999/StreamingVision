@@ -19,7 +19,6 @@ from genmatter.custom.track import run_track
 from genmatter.custom.viz import run_viz
 
 DEFAULT_CONFIG = _REPO_ROOT / "configs" / "custom_default.yaml"
-DEFAULT_BAYESOPT_CONFIG = _REPO_ROOT / "configs" / "custom_bayesopt.yaml"
 
 
 def _cmd_preprocess(args: argparse.Namespace) -> int:
@@ -105,31 +104,6 @@ def _cmd_pseudo_gt(args: argparse.Namespace) -> int:
         ui.console.print_exception()
         return 1
     return 0 if result.success else 1
-
-
-def _cmd_bayesopt(args: argparse.Namespace) -> int:
-    if not args.video_id:
-        print("genmatter bayesopt requires --video-id", file=sys.stderr)
-        return 2
-    try:
-        from genmatter.custom.bayesopt_cmd import run_bayesopt
-    except ImportError as e:
-        print(
-            "BayesOpt dependencies missing. Install with: uv sync --extra bayesopt",
-            file=sys.stderr,
-        )
-        print(e, file=sys.stderr)
-        return 1
-    run_bayesopt(
-        args.video_id,
-        tracking_config=Path(args.config).expanduser().resolve(),
-        bayesopt_config=Path(args.bayesopt_config).expanduser().resolve(),
-        run_id=args.run_id,
-        tracking_set=args.tracking_set or [],
-        bayesopt_set=args.bo_set or [],
-        resume=not args.no_resume,
-    )
-    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -234,23 +208,6 @@ def main(argv: list[str] | None = None) -> int:
         help="Only write RGB previews from existing uint16 segmasks (no SAM).",
     )
     p_pg.set_defaults(func=_cmd_pseudo_gt)
-
-    p_bo = sub.add_parser(
-        "bayesopt",
-        help="Bayesian optimization of tracking hyperparameters (64 Sobol + LCB).",
-    )
-    p_bo.add_argument("--video-id", type=str, required=True)
-    p_bo.add_argument("--config", type=str, default=str(DEFAULT_CONFIG))
-    p_bo.add_argument(
-        "--bayesopt-config",
-        type=str,
-        default=str(DEFAULT_BAYESOPT_CONFIG),
-    )
-    p_bo.add_argument("--run-id", type=str, default=None)
-    p_bo.add_argument("--no-resume", action="store_true")
-    p_bo.add_argument("--set", action="append", default=[], dest="tracking_set")
-    p_bo.add_argument("--bo-set", action="append", default=[], dest="bo_set")
-    p_bo.set_defaults(func=_cmd_bayesopt)
 
     args = parser.parse_args(argv)
     return int(args.func(args))

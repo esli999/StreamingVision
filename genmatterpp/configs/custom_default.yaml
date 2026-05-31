@@ -43,7 +43,7 @@ preprocess:
     seed: 42
     frame_name: "00000.jpg"
 
-# SAM2 pseudo-GT for evaluation / Bayesopt (all frames; faster than frame-0 SAM)
+# SAM2 pseudo-GT for evaluation (all frames; faster than frame-0 SAM)
 pseudo_gt:
   model: sam2.1_l.pt  # SAM2.1 large — same tier as preprocess sam_frame0
   min_threshold: 0.15

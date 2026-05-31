@@ -1,7 +1,9 @@
-# StreamingVision: tracker hyperparameters for test.mp4
-# Cloned from genmatterpp/configs/custom_default.yaml. Adjusted for the
-# streaming budget (64 blobs / 4 hyperblobs / 2925 datapoints) so the
-# hyperparameters tuned by bayesopt transfer directly to the streaming demo.
+# StreamingVision: default tracker hyperparameters for the live streaming demo.
+# Cloned from genmatterpp/configs/custom_default.yaml and adjusted for the
+# streaming budget (64 blobs / 4 hyperblobs / 2925 datapoints). The
+# multi-video live-calibrated companion (configs/streaming_general.yaml,
+# produced by scripts/calibrate_general.py) keeps the same shape so configs
+# can be swapped without recompiling the JIT.
 
 paths:
   custom_videos_root: assets/custom_videos
@@ -45,7 +47,7 @@ preprocess:
     seed: 42
     frame_name: "00000.jpg"
 
-# SAM2 pseudo-GT for offline bayesopt scoring
+# SAM2 pseudo-GT for offline evaluation / diagnostics
 pseudo_gt:
   model: sam2.1_l.pt
   min_threshold: 0.15

@@ -1005,7 +1005,7 @@ def compile_dino_tracking_program(
         mf = max_frames
     else:
         # StreamingVision patch: fall back to env var if DAVIS NPZs aren't present,
-        # so custom-video bayesopt runs don't require a DAVIS install.
+        # so custom-video calibration runs don't require a DAVIS install.
         try:
             mf = _genmatter_config.tapvid_davis_max_frames()
         except FileNotFoundError:

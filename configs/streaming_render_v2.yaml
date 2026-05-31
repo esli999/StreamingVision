@@ -7,10 +7,10 @@
 # dynamically). NO per-video knobs — the render grid reads the single
 # tracking.num_blobs / blob_means_updates_per_frame.
 #
-# num_blobs=128, init_gibbs_sweeps=5, calibration per-frame sweeps=1 (live demo runs 1).
+# num_blobs=128, init_gibbs_sweeps=1, calibration per-frame sweeps=1 (live demo runs 1).
 # Scalar tuple selected SELF-SUPERVISED on the TRAIN split; hypers learned
 # on TRAIN under this structure; validated ONCE on the HELD-OUT split vs the
-# shipping config (median Δ real-GT region-J = +0.0172; gate passed: True).
+# shipping config (median Δ real-GT region-J = +0.0016; gate passed: True).
 # Produced by scripts/calibrate_consistency.py. Do not hand-edit.
 paths:
   custom_videos_root: assets/custom_videos
@@ -68,70 +68,72 @@ tracking:
   random_seed: 42
   focal_length: 520.0
   use_sam_frame0: true
-  init_gibbs_sweeps: 5
+  init_gibbs_sweeps: 1
   tracking_outlier_prob: 1.0e-28
   dense_disable_outlier_prob: false
   calibrate_feature_sigmas: false
   blob_counting_threshold: 0
   hyperparams:
-    sigma_F: 0.28584102521489324
-    sigma_F_H: 1.5222373642149012
+    sigma_F: 0.38569269121330507
+    sigma_F_H: 1.050705145320235
     outlier_prob: 5.0
     outlier_velocity_gamma_shape: 5.0
     outlier_velocity_gamma_rate: 1.0
-    alpha: 1.8794247949120648
-    beta: 1.0442138325763841
+    alpha: 2.9259403008574223
+    beta: 1.085995904361067
     sigma_H: 25.0
-    sigma_V: 0.023490388685806683
-    translation_gaussian_scale: 0.14464779017493126
-    translation_max_radius: 0.5870999691486353
+    sigma_V: 0.03971709489426276
+    translation_gaussian_scale: 0.0787786604830995
+    translation_max_radius: 0.8692489324355112
     translation_num_radii_cells: 15
     translation_theta_step_deg: 15
     rotation_vmf_kappa: 100.0
     rotation_angle_max_deg: 25.0
     rotation_angle_step_deg: 0.375
     Psi_B:
-    - - 0.14582917094230652
-      - -0.0002466569421812892
-      - -0.002620100509375334
-    - - -0.0002466570003889501
-      - 0.027310790494084358
-      - -0.020097333937883377
-    - - -0.002620100509375334
-      - -0.020097337663173676
-      - 0.06425511837005615
+    - - 0.28162696957588196
+      - -0.00010107715934282169
+      - -0.005173679441213608
+    - - -0.0001010772175504826
+      - 0.04695134609937668
+      - -0.04017334803938866
+    - - -0.005173681303858757
+      - -0.04017334803938866
+      - 0.11926981806755066
     Psi_H:
-    - - 0.8911169171333313
-      - 0.006660568993538618
-      - -0.013411789201200008
-    - - 0.006660568993538618
-      - 0.7361724376678467
-      - -0.041567809879779816
-    - - -0.013411789201200008
-      - -0.041567809879779816
-      - 0.7772526144981384
+    - - 0.7877780795097351
+      - 0.011945286765694618
+      - -0.029508601874113083
+    - - 0.011945286765694618
+      - 0.4850018322467804
+      - -0.079826720058918
+    - - -0.029508601874113083
+      - -0.079826720058918
+      - 0.559911847114563
     Psi_V:
-    - - 0.0016560039948672056
-      - 5.6025015510385856e-05
-      - 0.00017114885849878192
-    - - 5.6025015510385856e-05
-      - 0.0011802290100604296
-      - -0.0003764917782973498
-    - - 0.000171148800291121
-      - -0.0003764917782973498
-      - 0.006733808666467667
-    nu_B: 48.0
-    nu_H: 12.25
-    nu_V: 42.449999999999996
+    - - 0.0024063726887106895
+      - 0.00010896912135649472
+      - 0.00019669928587973118
+    - - 0.00010896912135649472
+      - 0.0014093972276896238
+      - -0.0007672121282666922
+    - - 0.00019669925677590072
+      - -0.0007672121282666922
+      - 0.013462034985423088
+    nu_B: 49.745999999999995
+    nu_H: 8.70625
+    nu_V: 37.59149999999999
     mu_H:
-    - 0.037244975566864014
-    - -0.04550579562783241
-    - 2.4974987506866455
+    - 0.07244148850440979
+    - -0.088508740067482
+    - 2.4951353073120117
   feature_aware_final_assignment: true
   final_assignment_outlier: false
   freeze_hyperblob_assignment: true
   pure_object_seed: true
-  blob_means_updates_per_frame: 15
+  blob_means_updates_per_frame: 1
+  freeze_blob_features: false
+  feature_update_damping: 0.0
   use_calibrated_priors: true
 viz:
   pipeline:
