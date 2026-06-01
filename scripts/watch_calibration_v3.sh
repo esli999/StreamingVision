@@ -39,12 +39,12 @@ if sg:
     combos = sg.get("combos", [])
     grid = sg.get("grid", {})
     total = 1
-    for ax in ("num_blobs","init_gibbs_sweeps","num_gibbs_sweeps_per_frame","sigma_V","blob_means_updates","feature_update_damping"):
+    for ax in ("num_blobs","init_gibbs_sweeps","num_gibbs_sweeps_per_frame","sigma_V","blob_means_updates","feature_update_damping","final_feature_temp"):
         total *= max(len(grid.get(ax,[])), 1)
     print(f"[select] {len(combos)}/{total or '?'} combos scored (objective={sg.get('objective_mode','composite')})")
     for c in sorted(combos, key=lambda c: -(_g(c,'select_val_score','select_val_region_J') or -9)):
         print(f"         nb{c['combo'][0]:>3} igs{c['combo'][1]:>2} sw{c['combo'][2]} "
-              f"sv{float(_ci(c,3,0.1)):.0e} bmu{_ci(c,4,15)} fud{_ci(c,5,1.0)} -> "
+              f"sv{float(_ci(c,3,0.1)):.0e} bmu{_ci(c,4,15)} fud{_ci(c,5,1.0)} tau{_ci(c,6,1.0)} -> "
               f"obj {_g(c,'select_val_score','select_val_region_J'):.4f} "
               f"(rJ {c.get('select_val_region_J',float('nan')):.4f} p95 {c.get('select_val_median_p95',float('nan')):.4f})")
 sel = load("selected_infer.json")
@@ -52,7 +52,7 @@ if sel:
     print(f"[selected] num_blobs={sel.get('num_blobs')} init_gibbs_sweeps={sel.get('init_gibbs_sweeps')} "
           f"per_frame_sweeps={sel.get('num_gibbs_sweeps_per_frame')} "
           f"sigma_V_seed={sel.get('sigma_V_seed','?')} bmu={sel.get('blob_means_updates','?')} "
-          f"damping={sel.get('feature_update_damping','?')} "
+          f"damping={sel.get('feature_update_damping','?')} tau={sel.get('final_feature_temp','?')} "
           f"(SELECT_VAL obj {_g(sel,'select_val_score','select_val_region_J'):.4f})")
 em = load("em.json")
 iters = sorted(glob.glob(os.path.join(rd, "em_iter_*.json")))

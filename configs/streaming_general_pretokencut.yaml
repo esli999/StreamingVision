@@ -165,41 +165,6 @@ tracking:
   blob_means_updates_per_frame: 1
   freeze_blob_features: false
   feature_update_damping: 0.0
-  # TokenCut self-supervised seed augmentation, layered on the EXISTING ship hypers.
-  # A pure-JAX normalized-cut object discovery (scripts/tokencut.discover) on the DINO
-  # affinity graph locates objects SAM2 MISSES at the seed frame; multi-point SAM2
-  # re-prompts at the top-k GMM-posterior peaks for a crisp mask, painted ADDITIVELY
-  # only into SAM-uncovered cells → working videos are bit-identical no-ops.
-  # ALL knobs SELECTED self-supervised on TRAIN, no GT, no held-out: the recipe
-  # (raw384/edge/no-spatial/MaskCut) via tokencut.select_knobs (SAM-agreement), and
-  # n_points via tokencut.select_n_points (reprompt-vs-q agreement; scripts/
-  # _tokencut_select_npoints.py). Held-out GT is read ONLY inside the locked gate
-  # phase_validate_augmentation (cc._heldout_gate_enabled); any held-out GT read
-  # elsewhere asserts (cc._assert_gt_readable). GATE (ship hypers, flag OFF vs ON,
-  # 14 held-out DAVIS): median 0.6812->0.7013, mean +0.0249, horsejump-high +0.1755,
-  # parkour +0.1750, libby -0.0025; 11/14 bit-identical (all working/demo).
-  # n_points: TRAIN-selection is a tie over {2,3,5,8} (the fire objects' high-q cells
-  # cluster, so 2 points == 8), tie-broken to 2; n_points=2 is BIT-IDENTICAL held-out
-  # to the prior held-out-informed 8 — the leak is closed at zero demo cost.
-  # NOTE: a full EM re-fit UNDER the augmentation was run + gated and FAILED the strict
-  # gate (regressed working videos scooter -0.036, libby -0.026), so the conjugate
-  # hypers are NOT re-fit; only this additive, regression-free seed layer ships.
-  # Default-OFF in streaming_default.yaml (live path bit-exact).
-  tokencut_seed_augment: true
-  tokencut_knobs:
-    feature_source: raw384
-    edge_mode: true
-    use_spatial: false
-    posterior: gmm
-    n_cuts: 3
-    tau_edge: 0.2
-    T: 0.2
-    sigma_s: 0.3
-    q_thresh: 0.5
-    uncovered_thresh: 0.5
-    size_lo: 0.03
-    size_hi: 0.3
-    n_points: 2
   use_calibrated_priors: true
 viz:
   pipeline:

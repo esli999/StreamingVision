@@ -90,6 +90,24 @@ def _proposals():
                           "blob_means_updates_per_frame": 1},
         "damp0.75_drift": {"feature_update_damping": 0.75, "init_gibbs_sweeps": 1,
                            "blob_means_updates_per_frame": 1},
+        # --- INFERENCE: feature-TEMPERATURE on the FINAL assignment (Phase 1). tau>1
+        # up-weights the DINO features at the step that WRITES the labels the scorer
+        # reads, pushing the model tracker toward the frozen-centroid DINO classifier
+        # (~0.71 region-J) that beats it from the same seed. tau=1 reproduces the
+        # vendored feature-aware-final bit-for-bit (re-impl verification). Layer these
+        # on the CURRENT SHIP via `--base configs/streaming_general.yaml`. ---
+        # tau<1 DOWN-weights features (~ a larger effective feature sigma -> more
+        # appearance TOLERANCE), the proxy for "deforming objects need to tolerate
+        # within-object appearance variance" (rigid-vs-deforming diagnosis).
+        "tau0.25": {"final_feature_temp": 0.25},
+        "tau0.5": {"final_feature_temp": 0.5},
+        "tau0.75": {"final_feature_temp": 0.75},
+        "tau1": {"final_feature_temp": 1.0},
+        "tau2": {"final_feature_temp": 2.0},
+        "tau4": {"final_feature_temp": 4.0},
+        "tau8": {"final_feature_temp": 8.0},
+        "tau16": {"final_feature_temp": 16.0},
+        "feat_only": {"final_feature_temp": 1000.0},
     }
 
 
@@ -198,7 +216,7 @@ def score_tracker(vid, overrides, reference="gt", seed="sam"):
         sam_grid = cc._frame0_sam_grid(cc.discover_videos()[vid], labels)
     nsw = 1
     tr = cc._run_tracker_on_video(labels, cfg, -1, num_sweeps=nsw,
-                                  capture_blob_weights=False, sam_grid=sam_grid)
+                                  capture_blob_weights=False, sam_grid=sam_grid, vid=vid)
     if "error" in tr:
         return {"region_J": float("nan"), "error": tr["error"][:60]}
     hb = tr["hyperblob_a"]; idx = labels["indices"]; z = labels["Z_sam"]
@@ -232,7 +250,15 @@ def main(argv=None) -> int:
     ap.add_argument("--candidates", nargs="+", default=None,
                     help="default: dino_nc baselines + all tracker proposals")
     ap.add_argument("--videos", nargs="+", default=None, help="explicit video override")
+    ap.add_argument("--base", default=None,
+                    help="base config the proposals layer on (default: premotion). "
+                         "Use configs/streaming_general.yaml to gate vs the CURRENT SHIP.")
     args = ap.parse_args(argv)
+
+    if args.base:
+        global BASE_CFG_PATH
+        BASE_CFG_PATH = Path(args.base)
+        print(f"[pvc] base config := {BASE_CFG_PATH}", flush=True)
 
     cc._ensure_jax_setup(); cc._GT_SCORING_ALLOWED = True
     disc = cc.discover_videos()

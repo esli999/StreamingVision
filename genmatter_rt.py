@@ -48,6 +48,8 @@ import genmatterpp  # noqa: F401 — side effect: adds genmatterpp/ to sys.path
 import jax
 import jax.numpy as jnp
 from jax.random import key as jkey
+from jax.scipy.stats import multivariate_normal as _mvn_stats
+from jax.scipy.stats import norm as _norm_stats
 
 from genmatter.datatypes import *  # noqa: F401,F403 — load first for circular import
 from genmatter.model_3d import *   # noqa: F401,F403 — see VENDORED.md circular-import note
@@ -765,6 +767,97 @@ def init_state(positions: np.ndarray, velocities: np.ndarray, features: np.ndarr
     return state, key
 
 
+def _feature_temp_final_assignment(key, st, *, tau_feat, final_outlier: bool,
+                                   feat_anchor=None, use_anchor: bool = False):
+    """Re-implemented FINAL blob assignment with a DINO-feature TEMPERATURE.
+
+    Reproduces the vendored feature-aware-final logits (``gibbs_blob_assignments_dino``
+    with position_only=False/feature_only=False -> pos+vel+feat summed RAW, no cov
+    inflation, dino.py:700-721) but scales the feature term by ``tau_feat`` (a TRACED
+    scalar)::
+
+        logits[n, i] = pos_ll[n,i] + vel_ll[n,i] + tau_feat * feat_ll[n,i] + log_mix[i]
+
+    ``tau_feat == 1`` reproduces the vendored summed assignment to ~1e-6 (the only
+    difference is jax.scipy vs genjax logpdf; the categorical sampler is bit-identical,
+    verified).  ``tau_feat > 1`` up-weights the EXPERT DINO features at the step that
+    writes the labels the renderer/scorer read — pushing the model tracker toward the
+    frozen-centroid DINO classifier (~0.71 region-J) that beats the drifting tracker
+    from the same seed.  ``tau_feat -> inf`` approximates ``feature_only``.
+
+    ``use_anchor`` (with ``feat_anchor``, the FROZEN frame-0 blob appearance): score
+    the feature term against the anchor instead of the live (possibly drifted)
+    ``blob_features`` — matching what the anchor ``data_loglik`` objective rewards.  A
+    no-op when the live features equal the anchor (damping d=0).  All math is jax.scipy
+    (mvn/normal == genjax to ~1e-6, verified in scripts/_data_loglik.py)."""
+    posterior_key, _ = jax.random.split(key)
+    batch_size = 975                          # match dino.py:668 exactly
+    h = st.hypers
+    N = int(h.n_datapoints)
+    ds = st.datapoints_state
+    bs = st.blobs_state
+    pos = ds.datapoint_positions              # (N, 3)
+    vel = ds.datapoint_vels                   # (N, 3)
+    feat = ds.datapoint_features              # (N, D)
+    bm, bc = bs.blob_means, bs.blob_covs              # (L, 3), (L, 3, 3)
+    bvm, bvc = bs.blob_vel_means, bs.blob_vel_covs    # (L, 3), (L, 3, 3)
+    bf = bs.blob_features                     # (L, D)
+    feat_ref = feat_anchor if (use_anchor and feat_anchor is not None) else bf
+    sqrtF = jnp.sqrt(h.sigma_F)
+
+    # Precompute each blob's PRECISION + log-det ONCE (L small 3x3 matrices) so the
+    # per-datapoint Gaussian log-density is a cheap einsum quadratic form — NOT an
+    # N*L triangular solve (the vmap'd jax.scipy mvn.logpdf re-Choleskys per pair and
+    # OOMs the solve workspace when both the vendored + re-impl programs are resident).
+    _LOG2PI = float(np.log(2.0 * np.pi))
+
+    def _prep(covs):                          # covs (L,3,3) -> (prec (L,3,3), logdet (L,))
+        prec = jnp.linalg.inv(covs)
+        _, logdet = jnp.linalg.slogdet(covs)
+        return prec, logdet
+    prec_b, logdet_b = _prep(bc)
+    prec_v, logdet_v = _prep(bvc)
+    _cst3 = -1.5 * _LOG2PI                     # -0.5 * k * log(2pi), k=3
+
+    def _gauss_ll(x_B3, mu_L3, prec_L33, logdet_L):
+        # (B,3),(L,3),(L,3,3),(L,) -> (B,L) Gaussian log-density (== mvn.logpdf).
+        d = x_B3[:, None, :] - mu_L3[None, :, :]               # (B,L,3)
+        maha = jnp.einsum('bli,lij,blj->bl', d, prec_L33, d)   # (B,L)
+        return _cst3 - 0.5 * (logdet_L[None, :] + maha)        # (B,L)
+
+    blob_weights = bs.blob_weights
+    outlier_prob = h.outlier_prob if final_outlier else 0.0
+    ext = jnp.concatenate(
+        [blob_weights, jnp.asarray([outlier_prob], dtype=blob_weights.dtype)])
+    log_mix = jnp.log(ext / jnp.sum(ext))     # (L+1,)
+    a = h.outlier_velocity_gamma_shape
+    b = h.outlier_velocity_gamma_rate
+
+    def batch(carry, batch_idx):
+        idxs = jnp.arange(batch_size) + batch_idx * batch_size
+        p = pos[idxs]; v = vel[idxs]; f = feat[idxs]           # (B,3),(B,3),(B,D)
+        pos_ll = _gauss_ll(p, bm, prec_b, logdet_b)            # (B,L)
+        vel_ll = _gauss_ll(v, bvm, prec_v, logdet_v)           # (B,L)
+        # Feature term: sum_d N(f_d | feat_ref_d, sqrt(sigma_F)) — no solve.
+        feat_ll = jnp.sum(_norm_stats.logpdf(
+            f[:, None, :], feat_ref[None, :, :], sqrtF), axis=-1)   # (B,L)
+        log_liks = pos_ll + vel_ll + tau_feat * feat_ll        # (B,L)
+        if final_outlier:
+            speed = jnp.linalg.norm(v, axis=-1)                # (B,)
+            log_gamma_vel = ((a - 1) * jnp.log(speed + 1e-8) - b * speed
+                             - a * jnp.log(1.0 / b) - jax.lax.lgamma(a))   # (B,)
+        else:
+            log_gamma_vel = jnp.zeros(p.shape[0])              # outlier mix is -inf
+        raw = jnp.concatenate([log_liks, log_gamma_vel[:, None]], axis=1)  # (B,L+1)
+        return carry, raw + log_mix[None, :]
+
+    num_full = N // batch_size
+    _, bl = jax.lax.scan(batch, None, jnp.arange(num_full))
+    all_logprobs = bl.reshape(num_full * batch_size, -1)
+    updated = jax.random.categorical(posterior_key, all_logprobs)
+    return st.replace({'datapoints_state': {'blob_assignments': updated}})
+
+
 def blob_tracking_gibbs_dino_streaming(key, genmatter_state, *,
                                        feature_aware_final: bool,
                                        final_outlier: bool,
@@ -773,7 +866,10 @@ def blob_tracking_gibbs_dino_streaming(key, genmatter_state, *,
                                        freeze_blob_features: bool = False,
                                        feature_update_damping=None,
                                        blob_feat_anchor=None,
-                                       hb_feat_anchor=None):
+                                       hb_feat_anchor=None,
+                                       use_feature_temp_final: bool = False,
+                                       final_feature_temp=None,
+                                       final_assignment_anchor: bool = False):
     """Streaming-local re-implementation of
     ``genmatter.tracking.dino.blob_tracking_gibbs_dino`` (dino.py:743-832) whose
     FINAL assignment step (the dino.py:826 ``update_blob_assignments_with_outlier``
@@ -843,8 +939,12 @@ def blob_tracking_gibbs_dino_streaming(key, genmatter_state, *,
     ``blob_feat_anchor is None`` (the default) NONE of this runs and the existing
     vendored / ``freeze_blob_features`` static paths are byte-identical.
     """
-    # Build-time (Python, NOT traced) branch: blend only when an anchor is given.
-    _blend = blob_feat_anchor is not None
+    # Build-time (Python, NOT traced) branch: run the DAMPED feature blend only when
+    # BOTH an anchor AND an explicit damping are given.  Decoupled from the anchor
+    # alone so the feature-temperature final assignment (below) can reference the same
+    # frame-0 anchor (``final_assignment_anchor``) WITHOUT activating the damping blend
+    # (e.g. tau-only configs at damping unset).
+    _blend = (blob_feat_anchor is not None) and (feature_update_damping is not None)
 
     def update_blob_assignments_position_only(i, carry):
         key, st = carry
@@ -961,10 +1061,29 @@ def blob_tracking_gibbs_dino_streaming(key, genmatter_state, *,
             st = gibbs_hyperblob_features_dino(gibbs_key, st)
         return key, st
 
+    def update_blob_assignments_final_feature_temp(i, carry):
+        # Re-implemented feature-aware final assignment with a TRACED feature
+        # TEMPERATURE (and optional anchor-referenced feature term).  Replaces the
+        # vendored summed assignment so the DINO features can DRIVE the final labels.
+        key, st = carry
+        key, gibbs_key = jax.random.split(key)
+        st = _feature_temp_final_assignment(
+            gibbs_key, st, tau_feat=final_feature_temp, final_outlier=final_outlier,
+            feat_anchor=blob_feat_anchor, use_anchor=final_assignment_anchor)
+        key, gibbs_key = jax.random.split(key)
+        st = gibbs_blob_weights(gibbs_key, st)
+        return key, st
+
     # Python-bool branch at BUILD time (not traced): pick the final-step body.
-    final_step = (update_blob_assignments_final_feature_aware
-                  if feature_aware_final
-                  else update_blob_assignments_final_baseline)
+    # The feature-temperature re-impl (opt-in via use_feature_temp_final) takes
+    # precedence; default-off keeps the vendored feature-aware / baseline paths
+    # byte-identical.
+    if use_feature_temp_final:
+        final_step = update_blob_assignments_final_feature_temp
+    elif feature_aware_final:
+        final_step = update_blob_assignments_final_feature_aware
+    else:
+        final_step = update_blob_assignments_final_baseline
 
     key, genmatter_state = jax.lax.fori_loop(0, 3, hyperblob_update_loop, (key, genmatter_state))
     key, genmatter_state = jax.lax.fori_loop(0, 2, update_blob_assignments_feature_only, (key, genmatter_state))
@@ -1014,11 +1133,18 @@ _BLOB_MEANS_UPDATES_DEFAULT = 15
 # tracker scores ~0.50 from the SAME seed — the per-frame appearance update drifts
 # the object representation into background. jit-static; default False = bit-exact.
 _FREEZE_BLOB_FEATURES_DEFAULT = False
+# Phase-3 objective: weight on the instance-purity term in the combined
+# `anchor_pos_feat_purity` data_loglik variant.  The anchor term is ~ -40 (per-
+# datapoint mean loglik); purity is ~ [-log K, 0].  This scales purity so its
+# variation across configs is comparable to the anchor term's.  Tuned via the
+# Phase-3 proto (corr with GT) + the held-out gate; default a moderate value.
+_PURITY_WEIGHT = 20.0
 
 
 @partial(jax.jit, static_argnames=("feature_aware_final", "final_outlier",
                                     "freeze_hyperblob_assignment",
-                                    "blob_means_updates", "freeze_blob_features"))
+                                    "blob_means_updates", "freeze_blob_features",
+                                    "use_feature_temp_final", "final_assignment_anchor"))
 def _step_jit(key, state, positions, velocities, features,
               feature_aware_final: bool = _FEATURE_AWARE_FINAL_DEFAULT,
               final_outlier: bool = _FINAL_OUTLIER_DEFAULT,
@@ -1026,7 +1152,10 @@ def _step_jit(key, state, positions, velocities, features,
               blob_means_updates: int = _BLOB_MEANS_UPDATES_DEFAULT,
               freeze_blob_features: bool = _FREEZE_BLOB_FEATURES_DEFAULT,
               blob_feat_anchor=None, hb_feat_anchor=None,
-              feature_update_damping=None):
+              feature_update_damping=None,
+              use_feature_temp_final: bool = False,
+              final_feature_temp=None,
+              final_assignment_anchor: bool = False):
     """Body of `f_tracking_sweep` from run_davis_tracking.py:626-640, but
     standalone so we can call it per-frame instead of via lax.scan."""
     next_blob_means = state.blobs_state.blob_vel_means + state.blobs_state.blob_means
@@ -1048,6 +1177,9 @@ def _step_jit(key, state, positions, velocities, features,
         feature_update_damping=feature_update_damping,
         blob_feat_anchor=blob_feat_anchor,
         hb_feat_anchor=hb_feat_anchor,
+        use_feature_temp_final=use_feature_temp_final,
+        final_feature_temp=final_feature_temp,
+        final_assignment_anchor=final_assignment_anchor,
     )
     return state, key
 
@@ -1059,13 +1191,20 @@ def step(state, positions: np.ndarray, velocities: np.ndarray, features: np.ndar
          blob_means_updates: int = _BLOB_MEANS_UPDATES_DEFAULT,
          freeze_blob_features: bool = _FREEZE_BLOB_FEATURES_DEFAULT,
          blob_feat_anchor=None, hb_feat_anchor=None,
-         feature_update_damping=None):
+         feature_update_damping=None,
+         use_feature_temp_final: bool = False,
+         final_feature_temp=None,
+         final_assignment_anchor: bool = False):
     """One Gibbs sweep on the current frame.  Returns (new_state, new_key).
 
     ``blob_feat_anchor``/``hb_feat_anchor``/``feature_update_damping`` (all
     default None) activate the DAMPED anti-drift feature update (see
     ``blob_tracking_gibbs_dino_streaming``); they are passed to ``_step_jit`` as
     TRACED args (not static) so damping value + per-video anchor never recompile.
+
+    ``use_feature_temp_final`` / ``final_feature_temp`` / ``final_assignment_anchor``
+    select the re-implemented feature-temperature final assignment; ``final_feature_temp``
+    is a TRACED scalar (one compile across tau values), the two bools are static.
     """
     pj = jnp.asarray(positions)
     vj = jnp.asarray(velocities)
@@ -1074,6 +1213,8 @@ def step(state, positions: np.ndarray, velocities: np.ndarray, features: np.ndar
         feature_update_damping, dtype=jnp.float32)
     ba = None if blob_feat_anchor is None else jnp.asarray(blob_feat_anchor)
     ha = None if hb_feat_anchor is None else jnp.asarray(hb_feat_anchor)
+    tau = (jnp.asarray(1.0 if final_feature_temp is None else final_feature_temp,
+                       dtype=jnp.float32) if use_feature_temp_final else None)
     # Static (Python-bool/int) args -> _step_jit specializes one compile per combo.
     state, key = _step_jit(key, state, pj, vj, fj,
                            feature_aware_final=bool(feature_aware_final),
@@ -1082,7 +1223,10 @@ def step(state, positions: np.ndarray, velocities: np.ndarray, features: np.ndar
                            blob_means_updates=int(blob_means_updates),
                            freeze_blob_features=bool(freeze_blob_features),
                            blob_feat_anchor=ba, hb_feat_anchor=ha,
-                           feature_update_damping=damp)
+                           feature_update_damping=damp,
+                           use_feature_temp_final=bool(use_feature_temp_final),
+                           final_feature_temp=tau,
+                           final_assignment_anchor=bool(final_assignment_anchor))
     return state, key
 
 
@@ -1103,19 +1247,22 @@ def _make_multi_sweep_step(num_sweeps: int,
                            final_outlier: bool = _FINAL_OUTLIER_DEFAULT,
                            freeze_hyperblob_assignment: bool = _FREEZE_HYPERBLOB_ASSIGNMENT_DEFAULT,
                            blob_means_updates: int = _BLOB_MEANS_UPDATES_DEFAULT,
-                           freeze_blob_features: bool = _FREEZE_BLOB_FEATURES_DEFAULT):
+                           freeze_blob_features: bool = _FREEZE_BLOB_FEATURES_DEFAULT,
+                           use_feature_temp_final: bool = False,
+                           final_assignment_anchor: bool = False):
     """Build one jit'd N-sweep step; the caller caches it per distinct
     ``(num_sweeps, feature_aware_final, final_outlier,
-    freeze_hyperblob_assignment, blob_means_updates)``.  All are closed over as
-    Python values (the scan length is static; the flags select the
+    freeze_hyperblob_assignment, blob_means_updates, freeze_blob_features,
+    blend, use_feature_temp_final, final_assignment_anchor)``.  All are closed over
+    as Python values (the scan length is static; the flags select the
     final-assignment body, whether hyperblob membership is re-sampled, and the
     per-frame blob-mean refinement count in
     ``blob_tracking_gibbs_dino_streaming`` at build time), so they never force a
-    recompile mid-run."""
+    recompile mid-run.  ``final_feature_temp`` is a TRACED runtime arg."""
     @jax.jit
     def _multi_step(key, state, positions, velocities, features,
                     blob_feat_anchor=None, hb_feat_anchor=None,
-                    feature_update_damping=None):
+                    feature_update_damping=None, final_feature_temp=None):
         # Predict (constant-velocity dynamics) + splice the new frame ONCE.
         next_blob_means = state.blobs_state.blob_vel_means + state.blobs_state.blob_means
         state = state.replace({'blobs_state': {'blob_means': next_blob_means}})
@@ -1130,10 +1277,10 @@ def _make_multi_sweep_step(num_sweeps: int,
         def _sweep(carry, _):
             key, state = carry
             key, gibbs_key = jax.random.split(key)   # key threaded via carry
-            # blob_feat_anchor/hb_feat_anchor/feature_update_damping are TRACED
-            # runtime args (None when not damping) -> the anti-drift blend is
-            # baked once per (blend on/off) structure, not per damping value or
-            # per video.
+            # blob_feat_anchor/hb_feat_anchor/feature_update_damping/final_feature_temp
+            # are TRACED runtime args (None when inactive) -> the anti-drift blend and
+            # the feature-temperature are baked once per (structure) combo, not per
+            # damping/tau value or per video.
             state = blob_tracking_gibbs_dino_streaming(
                 gibbs_key, state,
                 feature_aware_final=feature_aware_final, final_outlier=final_outlier,
@@ -1143,6 +1290,9 @@ def _make_multi_sweep_step(num_sweeps: int,
                 feature_update_damping=feature_update_damping,
                 blob_feat_anchor=blob_feat_anchor,
                 hb_feat_anchor=hb_feat_anchor,
+                use_feature_temp_final=use_feature_temp_final,
+                final_feature_temp=final_feature_temp,
+                final_assignment_anchor=final_assignment_anchor,
             )
             return (key, state), None
 
@@ -1159,15 +1309,19 @@ def step_multi_sweep(state, positions: np.ndarray, velocities: np.ndarray,
                      blob_means_updates: int = _BLOB_MEANS_UPDATES_DEFAULT,
                      freeze_blob_features: bool = _FREEZE_BLOB_FEATURES_DEFAULT,
                      blob_feat_anchor=None, hb_feat_anchor=None,
-                     feature_update_damping=None):
+                     feature_update_damping=None,
+                     use_feature_temp_final: bool = False,
+                     final_feature_temp=None,
+                     final_assignment_anchor: bool = False):
     """N-sweep variant of ``step()``.  Falls through to ``step()`` when
     ``num_sweeps <= 1`` so the streaming code path pays no extra JIT compile or
     scan-of-1 overhead.  Caches one compiled implementation per
     ``(num_sweeps, feature_aware_final, final_outlier,
     freeze_hyperblob_assignment, blob_means_updates, freeze_blob_features,
-    blend)``.  The damped-feature anchors / damping are TRACED runtime args (not
-    in the cache key beyond the blend on/off bit), so one program serves all
-    damping values and all videos of equal shape."""
+    blend, use_feature_temp_final, final_assignment_anchor)``.  The damped-feature
+    anchors / damping / feature-temperature are TRACED runtime args (not in the cache
+    key beyond their on/off bits), so one program serves all damping/tau values and
+    all videos of equal shape."""
     if num_sweeps <= 1:
         return step(state, positions, velocities, features, key,
                     feature_aware_final=feature_aware_final,
@@ -1177,27 +1331,38 @@ def step_multi_sweep(state, positions: np.ndarray, velocities: np.ndarray,
                     freeze_blob_features=freeze_blob_features,
                     blob_feat_anchor=blob_feat_anchor,
                     hb_feat_anchor=hb_feat_anchor,
-                    feature_update_damping=feature_update_damping)
+                    feature_update_damping=feature_update_damping,
+                    use_feature_temp_final=use_feature_temp_final,
+                    final_feature_temp=final_feature_temp,
+                    final_assignment_anchor=final_assignment_anchor)
     pj = jnp.asarray(positions)
     vj = jnp.asarray(velocities)
     fj = jnp.asarray(features)
-    blend = blob_feat_anchor is not None
+    # The damping blend activates only when an explicit damping is ALSO set (mirrors
+    # ``_blend`` in blob_tracking_gibbs_dino_streaming) so an anchor passed purely for
+    # the anchor-referenced final assignment does not trigger the blend.
+    blend = (blob_feat_anchor is not None) and (feature_update_damping is not None)
     ba = None if blob_feat_anchor is None else jnp.asarray(blob_feat_anchor)
     ha = None if hb_feat_anchor is None else jnp.asarray(hb_feat_anchor)
     damp = None if feature_update_damping is None else jnp.asarray(
         feature_update_damping, dtype=jnp.float32)
+    tau = (jnp.asarray(1.0 if final_feature_temp is None else final_feature_temp,
+                       dtype=jnp.float32) if use_feature_temp_final else None)
     cache_key = (int(num_sweeps), bool(feature_aware_final), bool(final_outlier),
                  bool(freeze_hyperblob_assignment), int(blob_means_updates),
-                 bool(freeze_blob_features), bool(blend))
+                 bool(freeze_blob_features), bool(blend),
+                 bool(use_feature_temp_final), bool(final_assignment_anchor))
     fn = _MULTI_SWEEP_CACHE.get(cache_key)
     if fn is None:
         fn = _make_multi_sweep_step(num_sweeps, bool(feature_aware_final),
                                     bool(final_outlier),
                                     bool(freeze_hyperblob_assignment),
                                     int(blob_means_updates),
-                                    bool(freeze_blob_features))
+                                    bool(freeze_blob_features),
+                                    bool(use_feature_temp_final),
+                                    bool(final_assignment_anchor))
         _MULTI_SWEEP_CACHE[cache_key] = fn
-    state, key = fn(key, state, pj, vj, fj, ba, ha, damp)
+    state, key = fn(key, state, pj, vj, fj, ba, ha, damp, tau)
     return state, key
 
 
@@ -1269,7 +1434,8 @@ def run_tracker_from_cache(positions, velocities, features, indices, *, yaml_cfg
                            num_sweeps: int = 1, capture_blob_weights: bool = False,
                            sam_segmentation: Optional[np.ndarray] = None,
                            key_seed: int = 0,
-                           capture_data_loglik: bool = False) -> dict:
+                           capture_data_loglik: bool = False,
+                           z_sam_TN: Optional[np.ndarray] = None) -> dict:
     """Run ONLY the GenMatter Gibbs tracker over PRE-COMPUTED perception outputs
     (positions/velocities/features as cached in the pseudo-label .npz).
 
@@ -1344,6 +1510,22 @@ def run_tracker_from_cache(positions, velocities, features, indices, *, yaml_cfg
     _damp_raw = _trk.get("feature_update_damping", None)
     feature_update_damping = (float(_damp_raw) if _damp_raw is not None else None)
     use_damp = (feature_update_damping is not None) and (feature_update_damping < 1.0)
+    # INFERENCE lever (Phase 1): feature TEMPERATURE on the FINAL assignment.  When
+    # final_feature_temp is set, the final step is the re-implemented
+    # feature-temperature assignment (logits = pos + vel + tau*feat + log_mix), with
+    # tau a TRACED scalar (no recompile per value).  tau=1 reproduces the vendored
+    # feature-aware-final to ~1e-6; tau>1 up-weights the DINO features at the step that
+    # writes the labels.  Default (key absent) => off => bit-exact vendored path.
+    _tau_raw = _trk.get("final_feature_temp", None)
+    use_feature_temp_final = (_tau_raw is not None)
+    final_feature_temp = (float(_tau_raw) if _tau_raw is not None else 1.0)
+    # When set, the re-impl feature term scores against the FROZEN frame-0 anchor
+    # instead of the live (drifted) blob_features (matches the anchor data_loglik
+    # objective; a no-op at damping d=0 where live == anchor).
+    final_assignment_anchor = bool(_trk.get("final_assignment_anchor", False))
+    # The frame-0 anchor is needed by the damping blend (use_damp) AND by the
+    # anchor-referenced final assignment; capture it if EITHER asks for it.
+    _need_anchor = use_damp or (use_feature_temp_final and final_assignment_anchor)
     blob_feat_anchor = None
     hb_feat_anchor = None
     for t in range(T):
@@ -1355,9 +1537,9 @@ def run_tracker_from_cache(positions, velocities, features, indices, *, yaml_cfg
                                     sam_segmentation=sam_segmentation,
                                     subsample_indices=indices,
                                     verbose=False)
-            # Capture the post-warmup frame-0 appearance as the damping anchor
-            # (before the first per-frame step can drift it). Traced from here on.
-            if use_damp:
+            # Capture the post-warmup frame-0 appearance as the damping / anchor-final
+            # anchor (before the first per-frame step can drift it). Traced from here on.
+            if _need_anchor:
                 blob_feat_anchor = jnp.asarray(state.blobs_state.blob_features)
                 hb_feat_anchor = jnp.asarray(state.hyperblobs_state.hyperblob_features)
             # The data_loglik objective scores features against this SAME frozen
@@ -1375,7 +1557,10 @@ def run_tracker_from_cache(positions, velocities, features, indices, *, yaml_cfg
                                           freeze_blob_features=freeze_blob_features,
                                           blob_feat_anchor=blob_feat_anchor,
                                           hb_feat_anchor=hb_feat_anchor,
-                                          feature_update_damping=feature_update_damping)
+                                          feature_update_damping=feature_update_damping,
+                                          use_feature_temp_final=use_feature_temp_final,
+                                          final_feature_temp=final_feature_temp,
+                                          final_assignment_anchor=final_assignment_anchor)
             state.datapoints_state.blob_assignments.block_until_ready()
         else:
             t0 = _time.monotonic()
@@ -1388,7 +1573,10 @@ def run_tracker_from_cache(positions, velocities, features, indices, *, yaml_cfg
                                           freeze_blob_features=freeze_blob_features,
                                           blob_feat_anchor=blob_feat_anchor,
                                           hb_feat_anchor=hb_feat_anchor,
-                                          feature_update_damping=feature_update_damping)
+                                          feature_update_damping=feature_update_damping,
+                                          use_feature_temp_final=use_feature_temp_final,
+                                          final_feature_temp=final_feature_temp,
+                                          final_assignment_anchor=final_assignment_anchor)
             state.datapoints_state.blob_assignments.block_until_ready()
             step_walls.append(_time.monotonic() - t0)
         blob_a, hyperblob_a = extract_assignments(state)
@@ -1396,8 +1584,14 @@ def run_tracker_from_cache(positions, velocities, features, indices, *, yaml_cfg
         hb_a_list.append(hyperblob_a)
         outlier_fracs.append(float(np.mean(blob_a == -1)))
         if capture_data_loglik:
-            terms = _loglik_terms_jit(state, loglik_blob_anchor)
-            loglik_terms_list.append({k: float(v) for k, v in terms.items()})
+            terms = {k: float(v) for k, v in
+                     _loglik_terms_jit(state, loglik_blob_anchor).items()}
+            # Phase-3 instance-purity term (host-side numpy from the CLUSTER labels
+            # the scorer reads vs the temporally-consistent SAM instances).
+            if z_sam_TN is not None and t < len(z_sam_TN):
+                terms["inst_purity"] = _dll.instance_purity_meanll(
+                    hyperblob_a, z_sam_TN[t])
+            loglik_terms_list.append(terms)
         if capture_blob_weights:
             w, key = extract_blob_weights(state, key)
             blob_w_list.append(w)
@@ -1419,8 +1613,19 @@ def run_tracker_from_cache(positions, velocities, features, indices, *, yaml_cfg
         # (comparable across videos). "data_loglik" is the headline scalar (the
         # full complete-data density); the rest are exposed for the Phase-B proto
         # to pick the best GT-correlating formulation.
-        keys = loglik_terms_list[0].keys()
-        agg = {k: float(np.mean([d[k] for d in loglik_terms_list])) for k in keys}
+        # Union of keys (inst_purity is present only when z_sam_TN was supplied).
+        keys = set().union(*(d.keys() for d in loglik_terms_list))
+        agg = {k: float(np.mean([d[k] for d in loglik_terms_list if k in d]))
+               for k in keys}
+        # Phase-3 combined objective: the anchor feature term (appearance fit) PLUS a
+        # weighted instance-purity term (bleed penalty from the SAM instances). The
+        # anchor term is a per-datapoint mean loglik (~ -40); purity is a mean log-prob
+        # (~ [-log K, 0]) — _PURITY_WEIGHT scales purity's VARIATION to be comparable so
+        # it can shift selection toward less-bleeding (and less freeze-conservative)
+        # configs. The Phase-3 proto + held-out gate validate the variant/weight.
+        if "inst_purity" in agg and "anchor_pos_feat" in agg:
+            agg["anchor_pos_feat_purity"] = (
+                agg["anchor_pos_feat"] + _PURITY_WEIGHT * agg["inst_purity"])
         out["data_loglik_terms"] = agg
         # Headline = the ANCHOR-referenced objective (the naive live-feature "full"
         # rewards drift). _pick_data_loglik selects the configured variant from the

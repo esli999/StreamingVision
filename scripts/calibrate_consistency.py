@@ -176,6 +176,53 @@ def _gt_scoring_enabled():
     finally:
         _GT_SCORING_ALLOWED = prev
 
+
+# ----------------------------------------------------------------------
+# Held-out GT lock (the durable anti-hacking guard). `_GT_SCORING_ALLOWED`
+# alone is too coarse: it is a single on/off flag any caller can flip, so a dev
+# script could read HELD-OUT GT to inform a DESIGN choice — methodological
+# leakage even when no knob is fit to it. We therefore split the permission:
+#   * TRAIN GT  — readable whenever `_GT_SCORING_ALLOWED` is set (development
+#                 diagnostics + the TRAIN design re-derivation may use it).
+#   * HELD-OUT GT — readable ONLY inside the single sanctioned generalization
+#                 gate (`_heldout_gate_enabled()`, entered by phase_validate*).
+# The check fails CLOSED: any GT read of a HELDOUT_VIDEOS member outside that
+# scope raises, so the held-out numbers can be produced exactly once, through
+# the gate, and the design can never be (even implicitly) tuned to them.
+# ----------------------------------------------------------------------
+_HELDOUT_GATE_ACTIVE = False
+
+
+@contextlib.contextmanager
+def _heldout_gate_enabled():
+    """Scope inside which HELD-OUT video GT may be read — the one sanctioned
+    generalization gate (phase_validate / phase_validate_augmentation). Outside
+    it, reading a HELDOUT_VIDEOS GT mask asserts even when `_GT_SCORING_ALLOWED`
+    is True. Nest inside `_gt_scoring_enabled()`."""
+    global _HELDOUT_GATE_ACTIVE
+    prev = _HELDOUT_GATE_ACTIVE
+    _HELDOUT_GATE_ACTIVE = True
+    try:
+        yield
+    finally:
+        _HELDOUT_GATE_ACTIVE = prev
+
+
+def _assert_gt_readable(vid: str) -> None:
+    """The single chokepoint every true-DAVIS-GT read passes through. Fail
+    CLOSED: any GT read requires `_GT_SCORING_ALLOWED`; a HELD-OUT video's GT
+    additionally requires the sanctioned gate scope. This makes held-out GT
+    physically unreadable outside phase_validate* — design + diagnostics are
+    confined to TRAIN."""
+    assert _GT_SCORING_ALLOWED, (
+        "true DAVIS GT accessed outside a GT-scoring scope — train/held-out "
+        "leakage. Learning + selection are self-supervised (reference='sam') only.")
+    if vid in HELDOUT_VIDEOS:
+        assert _HELDOUT_GATE_ACTIVE, (
+            f"HELD-OUT GT for {vid!r} read outside the sanctioned gate "
+            "(_heldout_gate_enabled, entered only by phase_validate*). Held-out "
+            "GT is gate-only; design + diagnostics must use TRAIN videos.")
+
 # Initialization: GenMatter DAVIS DINO experiment defaults (see
 # genmatterpp/genmatter/tracking/dino.py:DinoTrackingHyperparams). The
 # material difference from streaming_default.yaml is sigma_F: 2.0 -> 0.2.
@@ -325,6 +372,24 @@ INFER_BLOB_MEANS_UPDATES = 15      # per-frame gibbs_blob_means refinement count
 # supersedes it).
 INFER_FREEZE_BLOB_FEATURES = False
 INFER_FEATURE_UPDATE_DAMPING = 1.0
+# INFERENCE feature-TEMPERATURE on the FINAL assignment (Phase 1 re-optimization).
+# final_feature_temp (tau) scales the DINO-feature term at the step that WRITES the
+# labels: logits = pos + vel + tau*feat + log_mix. tau=1 reproduces the vendored
+# feature-aware-final bit-for-bit; tau>1 up-weights the expert features (toward the
+# frozen-centroid classifier that beats the drifting tracker). SELECTED on TRAIN in
+# phase_select; default 1.0 keeps the shipped numerics. final_assignment_anchor scores
+# the re-impl feature term vs the FROZEN frame-0 anchor (no-op at damping d=0).
+INFER_FINAL_FEATURE_TEMP = 1.0
+INFER_FINAL_ASSIGNMENT_ANCHOR = False
+# TokenCut self-supervised seed augmentation (scripts/tokencut). Default-off keeps
+# the cfg bit-exact; --tokencut-seed-augment turns it ON for the WHOLE pipeline so
+# the conjugate hypers are LEARNED-UNDER and SELECTED-UNDER the augmented seeds
+# (the coherent methodology, not a bolt-on). Self-supervised (TokenCut+SAM2, NO GT)
+# → legal in phase_em/phase_select; GT is still read only in phase_validate. The
+# augmented grids are cached to disk (deterministic per vid+knobs) so the EM stays
+# fast. Knobs come from the self-supervised select (runs/.../tokencut_knobs.json).
+INFER_TOKENCUT_SEED_AUGMENT = False
+INFER_TOKENCUT_KNOBS = None
 
 OUT_ROOT = _REPO_ROOT / "runs" / "calibrate_consistency"
 LABELS_DIR = OUT_ROOT / "labels"
@@ -447,9 +512,12 @@ def _sam_annotations_path(entry: VideoEntry) -> str:
     return str(entry.sam_dir.parent)
 
 
-def _davis_gt_path() -> str:
+def _davis_gt_path(vid: str) -> str:
     """Real DAVIS GT segmasks dir — used ONLY for the final validation report
-    (the true benchmark), never for the self-supervised EM objective."""
+    (the true benchmark), never for the self-supervised EM objective. ``vid`` is
+    required so the held-out lock can verify the caller is inside the sanctioned
+    gate (the matter-J GT read at the validate call site)."""
+    _assert_gt_readable(vid)   # GT scope required; held-out GT gate-only
     import config as gm_config
     return str(gm_config.DAVIS_SEGMASKS_PATH)
 
@@ -497,7 +565,10 @@ def _infer_cfg(*, use_sam_frame0: bool, num_blobs: int, num_hyperblobs: int,
                pure_object_seed: bool = INFER_PURE_OBJECT_SEED,
                blob_means_updates: int = INFER_BLOB_MEANS_UPDATES,
                freeze_blob_features: bool = INFER_FREEZE_BLOB_FEATURES,
-               feature_update_damping: float = INFER_FEATURE_UPDATE_DAMPING) -> dict:
+               feature_update_damping: float = INFER_FEATURE_UPDATE_DAMPING,
+               final_feature_temp: float = INFER_FINAL_FEATURE_TEMP,
+               final_assignment_anchor: bool = INFER_FINAL_ASSIGNMENT_ANCHOR,
+               tokencut_seed_augment=None, tokencut_knobs=None) -> dict:
     """Bundle the inference-strategy + architectural-structure knobs threaded into
     _make_yaml_cfg + the tracker. ONE global config — the same dict drives EM,
     accept-test, validate (chosen pass), and the emitted YAML.
@@ -517,7 +588,16 @@ def _infer_cfg(*, use_sam_frame0: bool, num_blobs: int, num_hyperblobs: int,
             "pure_object_seed": bool(pure_object_seed),
             "blob_means_updates": int(blob_means_updates),
             "freeze_blob_features": bool(freeze_blob_features),
-            "feature_update_damping": float(feature_update_damping)}
+            "feature_update_damping": float(feature_update_damping),
+            "final_feature_temp": float(final_feature_temp),
+            "final_assignment_anchor": bool(final_assignment_anchor),
+            # Default to the module globals (set once from the CLI in main) so EM /
+            # select / validate-chosen all build cfgs UNDER the augmentation; the
+            # shipping-baseline path passes tokencut_seed_augment EXPLICITLY from the
+            # baseline YAML (reverted → off) so the validate 'before' stays un-augmented.
+            "tokencut_seed_augment": bool(INFER_TOKENCUT_SEED_AUGMENT
+                                          if tokencut_seed_augment is None else tokencut_seed_augment),
+            "tokencut_knobs": (INFER_TOKENCUT_KNOBS if tokencut_knobs is None else tokencut_knobs)}
 
 
 # Inference config for the SHIPPING baseline (validate's honest "before"): the
@@ -1121,6 +1201,30 @@ def _make_yaml_cfg(em: EmState, infer: dict) -> dict:
         infer.get("freeze_blob_features", INFER_FREEZE_BLOB_FEATURES))
     cfg["tracking"]["feature_update_damping"] = float(
         infer.get("feature_update_damping", INFER_FEATURE_UPDATE_DAMPING))
+    # INFERENCE feature-temperature (Phase 1): tau on the final assignment. Written
+    # into EVERY _make_yaml_cfg output so the EM learns the hypers UNDER the chosen
+    # tau, selection sweeps it, and the emitted YAML ships the SELECTED value. tau=1
+    # is the re-impl of the vendored feature-aware-final (bit-exact). Only emitted
+    # when != 1.0 (absent key => off => vendored path) keeps default configs clean.
+    _tau = float(infer.get("final_feature_temp", INFER_FINAL_FEATURE_TEMP))
+    if _tau != 1.0:
+        cfg["tracking"]["final_feature_temp"] = _tau
+        cfg["tracking"]["final_assignment_anchor"] = bool(
+            infer.get("final_assignment_anchor", INFER_FINAL_ASSIGNMENT_ANCHOR))
+    else:
+        cfg["tracking"].pop("final_feature_temp", None)
+        cfg["tracking"].pop("final_assignment_anchor", None)
+    # TokenCut self-supervised seed augmentation (default-off). Carried on the infer
+    # dict so the validate BASELINE (un-augmented shipping config) and CHOSEN
+    # (augmented re-fit) differ by exactly this flag. Honored at the one chokepoint
+    # _run_tracker_on_video; the live streaming_default.yaml never sets it.
+    if infer.get("tokencut_seed_augment"):
+        cfg["tracking"]["tokencut_seed_augment"] = True
+        if infer.get("tokencut_knobs"):
+            cfg["tracking"]["tokencut_knobs"] = dict(infer["tokencut_knobs"])
+    else:
+        cfg["tracking"].pop("tokencut_seed_augment", None)
+        cfg["tracking"].pop("tokencut_knobs", None)
     cfg["tracking"]["calibrate_feature_sigmas"] = False
     cfg["tracking"]["use_calibrated_priors"] = bool(em.use_calibrated_priors)
     hp = cfg["tracking"]["hyperparams"]
@@ -1152,13 +1256,17 @@ def _run_tracker_on_video(labels_TN: dict, yaml_cfg: dict, max_frames: int, *,
                            num_sweeps: int = 1,
                            capture_blob_weights: bool = False,
                            sam_grid: Optional[np.ndarray] = None,
-                           capture_data_loglik: bool = False) -> dict:
+                           capture_data_loglik: bool = False,
+                           vid: Optional[str] = None) -> dict:
     """Run the Gibbs tracker over a video's CACHED perception outputs (the
     positions/velocities/features stored in its pseudo-label .npz) — no
     depth/flow/DINO recompute, since perception is invariant to the calibration
     hypers. ``num_sweeps`` is the Level-1 per-frame measurement-update depth.
     ``sam_grid`` (when given AND yaml_cfg enables use_sam_frame0) seeds the
-    frame-0 semantic SAM init. Returns stacked arrays (blob_a/hyperblob_a, plus
+    frame-0 semantic SAM init. When ``yaml_cfg['tracking']['tokencut_seed_augment']``
+    is set (default-off) AND ``vid`` is known, the frame-0 seed is additively
+    augmented with TokenCut+SAM2-discovered objects SAM missed (working videos are
+    a no-op by construction). Returns stacked arrays (blob_a/hyperblob_a, plus
     blob_w/n_blobs/indices when requested) or {'error': ...}."""
     import genmatter_rt
     try:
@@ -1170,10 +1278,28 @@ def _run_tracker_on_video(labels_TN: dict, yaml_cfg: dict, max_frames: int, *,
             pos, vel, feat = pos[:max_frames], vel[:max_frames], feat[:max_frames]
         nb = int(yaml_cfg["tracking"]["num_blobs"])
         nh = int(yaml_cfg["tracking"]["num_hyperblobs"])
+        # Default-off TokenCut seed augmentation (self-supervised object discovery
+        # for the broken videos SAM2 misses; additive + uncovered-only → working
+        # videos untouched). Never breaks the tracker: any failure falls back to
+        # the base SAM grid.
+        if (sam_grid is not None and vid is not None
+                and yaml_cfg.get("tracking", {}).get("tokencut_seed_augment")):
+            try:
+                import tokencut
+                sam_grid, _ = tokencut.augment_seed_grid(
+                    vid, labels_TN, sam_grid, yaml_cfg["tracking"].get("tokencut_knobs"))
+            except Exception as _e:
+                _log(f"tokencut augment failed for {vid}: {_e!r} (using base grid)")
+        # Phase-3: the temporally-consistent SAM instances (Z_sam) drive the
+        # instance-purity objective term (host-side; self-supervised, NOT GT).
+        z_sam_TN = labels_TN.get("Z_sam") if capture_data_loglik else None
+        if z_sam_TN is not None and max_frames is not None and max_frames > 0:
+            z_sam_TN = z_sam_TN[:max_frames]
         return genmatter_rt.run_tracker_from_cache(
             pos, vel, feat, idx, yaml_cfg=yaml_cfg, num_blobs=nb, num_hyperblobs=nh,
             num_sweeps=num_sweeps, capture_blob_weights=capture_blob_weights,
-            sam_segmentation=sam_grid, capture_data_loglik=capture_data_loglik)
+            sam_segmentation=sam_grid, capture_data_loglik=capture_data_loglik,
+            z_sam_TN=z_sam_TN)
     except Exception as e:
         return {"error": repr(e)}
 
@@ -1284,9 +1410,7 @@ def _gt_dp_at_datapoints(vid: str, frame_idx: int, indices_N: np.ndarray):
     Resize the full mask to the (GRID_H, GRID_W) stride-8 grid (nearest), then
     index the datapoints. Returns an (N,) bool array, or None if the mask is
     missing/unreadable."""
-    assert _GT_SCORING_ALLOWED, (
-        "true DAVIS GT accessed outside phase_validate — train/held-out leakage. "
-        "Learning + selection are self-supervised (reference='sam') only.")
+    _assert_gt_readable(vid)   # GT scope required; held-out GT gate-only
     import config as gm_config
     import cv2
     p = Path(gm_config.DAVIS_SEGMASKS_PATH) / vid / f"{int(frame_idx):05d}.png"
@@ -1333,9 +1457,7 @@ def _score_video_region_J(vid: str, label_TN: np.ndarray, indices_N: np.ndarray,
         Tc = min(T, Tz)
         fg_of = lambda t: (z_sam[t] > 0)                # (N,) bool, self-supervised
     elif reference == "gt":
-        assert _GT_SCORING_ALLOWED, (
-            "reference='gt' region-J invoked outside phase_validate — "
-            "train/held-out leakage. Learning + selection use reference='sam' only.")
+        _assert_gt_readable(vid)   # GT scope required; held-out GT gate-only
         fi = np.asarray(labels["frame_idx"]).reshape(-1)
         Tc = min(T, int(fi.shape[0]))
         fg_of = lambda t: _gt_dp_at_datapoints(vid, int(fi[t]), indices_N)
@@ -1700,7 +1822,9 @@ def phase_em(out_root: Path, *, force: bool = False,
               pure_object_seed: bool = INFER_PURE_OBJECT_SEED,
               blob_means_updates: int = INFER_BLOB_MEANS_UPDATES,
               freeze_blob_features: bool = INFER_FREEZE_BLOB_FEATURES,
-              feature_update_damping: float = INFER_FEATURE_UPDATE_DAMPING) -> dict:
+              feature_update_damping: float = INFER_FEATURE_UPDATE_DAMPING,
+              final_feature_temp: float = INFER_FINAL_FEATURE_TEMP,
+              final_assignment_anchor: bool = INFER_FINAL_ASSIGNMENT_ANCHOR) -> dict:
     """Outer EM loop: run the deep-N-sweep tracker → MAP-posterior M-step → veto →
     damp → per-group composite-J accept-test → repeat.
 
@@ -1736,7 +1860,9 @@ def phase_em(out_root: Path, *, force: bool = False,
                        freeze_hyperblob=freeze_hyperblob, pure_object_seed=pure_object_seed,
                        blob_means_updates=blob_means_updates,
                        freeze_blob_features=freeze_blob_features,
-                       feature_update_damping=feature_update_damping)
+                       feature_update_damping=feature_update_damping,
+                       final_feature_temp=final_feature_temp,
+                       final_assignment_anchor=final_assignment_anchor)
     # TRAIN-split restriction: learning (main pass + M-step + accept-test) sees
     # ONLY train_videos; held-out + GT are reserved for phase_validate. None =
     # legacy all-cached behaviour.
@@ -1817,7 +1943,7 @@ def phase_em(out_root: Path, *, force: bool = False,
             tr = _run_tracker_on_video(labels_cache[vid], yaml_cfg, max_frames_per_video,
                                        num_sweeps=num_gibbs_sweeps_per_frame,
                                        capture_blob_weights=True,
-                                       sam_grid=sam_grids.get(vid),
+                                       sam_grid=sam_grids.get(vid), vid=vid,
                                        capture_data_loglik=(_OBJECTIVE_MODE == "data_loglik"))
             if "error" in tr:
                 tracker_errors[vid] = tr["error"]
@@ -2008,7 +2134,7 @@ def _score_subset_J(em: EmState, labels_cache: Dict[str, dict],
             continue
         tr = _run_tracker_on_video(labels_cache[vid], yaml_cfg, max_frames,
                                    num_sweeps=num_sweeps, capture_blob_weights=True,
-                                   sam_grid=sam_grids.get(vid),
+                                   sam_grid=sam_grids.get(vid), vid=vid,
                                    capture_data_loglik=(_OBJECTIVE_MODE == "data_loglik"))
         if "error" in tr:
             continue
@@ -2156,6 +2282,11 @@ def phase_select(out_root: Path, *, force: bool = False,
     # Pass e.g. [0.0, 0.25, 0.5, 1.0] to SELECT the damping self-supervised on
     # TRAIN (scored by the Phase-B data_loglik objective on SELECT_VAL).
     grid.setdefault("feature_update_damping", [INFER_FEATURE_UPDATE_DAMPING])
+    # Phase-1 INFERENCE feature-temperature axis: default a SINGLE value (no
+    # explosion). Pass e.g. [1.0, 2.0, 4.0, 8.0] to SELECT tau self-supervised on
+    # TRAIN (scored by the data_loglik objective on SELECT_VAL). Capped (no
+    # feat_only) keeps a position floor against the R-circ degeneracy.
+    grid.setdefault("final_feature_temp", [INFER_FINAL_FEATURE_TEMP])
     if base_infer_kwargs is None:
         base_infer_kwargs = dict(use_sam_frame0=INFER_USE_SAM_FRAME0,
                                  num_hyperblobs=INFER_NUM_HYPERBLOBS,
@@ -2182,30 +2313,34 @@ def phase_select(out_root: Path, *, force: bool = False,
          f"({len(TRAIN_VIDEOS)} videos), {em_iters} iters/combo")
 
     # Combo = (num_blobs, init_gibbs_sweeps, per_frame_sweeps, sigma_V,
-    #          blob_means_updates, feature_update_damping).
+    #          blob_means_updates, feature_update_damping, final_feature_temp).
     combos = list(itertools.product(
         grid["num_blobs"], grid["init_gibbs_sweeps"], grid["num_gibbs_sweeps_per_frame"],
-        grid["sigma_V"], grid["blob_means_updates"], grid["feature_update_damping"]))
+        grid["sigma_V"], grid["blob_means_updates"], grid["feature_update_damping"],
+        grid["final_feature_temp"]))
     _log(f"select: {len(combos)} grid combos "
          f"(num_blobs={grid['num_blobs']} init_gibbs_sweeps={grid['init_gibbs_sweeps']} "
          f"per_frame_sweeps={grid['num_gibbs_sweeps_per_frame']} "
          f"sigma_V={grid['sigma_V']} blob_means_updates={grid['blob_means_updates']} "
-         f"feature_update_damping={grid['feature_update_damping']})")
+         f"feature_update_damping={grid['feature_update_damping']} "
+         f"final_feature_temp={grid['final_feature_temp']})")
 
-    for ci, (nb, igs, nsw, sv, bmu, fud) in enumerate(combos, 1):
-        combo_key = (nb, igs, nsw, float(sv), bmu, float(fud))
+    for ci, (nb, igs, nsw, sv, bmu, fud, tau) in enumerate(combos, 1):
+        combo_key = (nb, igs, nsw, float(sv), bmu, float(fud), float(tau))
         sv_tag = f"{float(sv):g}".replace("+", "")
         fud_tag = f"{float(fud):g}"
-        label = f"nb{nb}/igs{igs}/sw{nsw}/sv{sv_tag}/bmu{bmu}/fud{fud_tag}"
+        tau_tag = f"{float(tau):g}"
+        label = f"nb{nb}/igs{igs}/sw{nsw}/sv{sv_tag}/bmu{bmu}/fud{fud_tag}/tau{tau_tag}"
         if combo_key in done:
             _log(f"select [{ci}/{len(combos)}] {label}: cached, skip")
             continue
         t0 = time.monotonic()
-        combo_root = out_root / "select" / f"nb{nb}_igs{igs}_sw{nsw}_sv{sv_tag}_bmu{bmu}_fud{fud_tag}"
+        combo_root = out_root / "select" / f"nb{nb}_igs{igs}_sw{nsw}_sv{sv_tag}_bmu{bmu}_fud{fud_tag}_tau{tau_tag}"
         combo_root.mkdir(parents=True, exist_ok=True)
         combo_infer_kwargs = {**base_infer_kwargs, "num_blobs": nb,
                               "init_gibbs_sweeps": igs, "blob_means_updates": bmu,
-                              "feature_update_damping": float(fud)}
+                              "feature_update_damping": float(fud),
+                              "final_feature_temp": float(tau)}
         # Short EM on TRAIN under this inference combo (resumable: phase_em caches
         # combo_root/em.json and returns it on re-entry unless force). The short EM
         # does NOT use the Phase-D val loop (em_val_videos=None) so SELECT_VAL stays
@@ -2227,7 +2362,7 @@ def phase_select(out_root: Path, *, force: bool = False,
         for vid in labels_cache:
             tr = _run_tracker_on_video(labels_cache[vid], yaml_cfg, max_frames_per_video,
                                        num_sweeps=nsw, capture_blob_weights=True,
-                                       sam_grid=sam_grids.get(vid),
+                                       sam_grid=sam_grids.get(vid), vid=vid,
                                        capture_data_loglik=(_OBJECTIVE_MODE == "data_loglik"))
             if "error" in tr:
                 continue
@@ -2243,10 +2378,11 @@ def phase_select(out_root: Path, *, force: bool = False,
         median_score = float(np.median(list(per_vid_score.values()))) if per_vid_score else float("nan")
         median_regionJ = float(np.median(list(per_vid_regionJ.values()))) if per_vid_regionJ else float("nan")
         median_p95 = float(np.median(p95s)) if p95s else float("nan")
-        rec = {"combo": [nb, igs, nsw, float(sv), bmu, float(fud)],
+        rec = {"combo": [nb, igs, nsw, float(sv), bmu, float(fud), float(tau)],
                "num_blobs": nb, "init_gibbs_sweeps": igs,
                "num_gibbs_sweeps_per_frame": nsw, "sigma_V": float(sv),
                "blob_means_updates": bmu, "feature_update_damping": float(fud),
+               "final_feature_temp": float(tau),
                "select_val_score": median_score,         # objective (composite | data_loglik)
                "select_val_region_J": median_regionJ,    # binary region-J (display/diag)
                "select_val_median_p95": median_p95,
@@ -2276,6 +2412,7 @@ def phase_select(out_root: Path, *, force: bool = False,
         int(c["combo"][0]), int(c["combo"][2]), int(c["combo"][1]),
         -float(_combo_at(c, 3, _SIGMA_V_SEED)), int(_combo_at(c, 4, INFER_BLOB_MEANS_UPDATES)),
         -float(_combo_at(c, 5, INFER_FEATURE_UPDATE_DAMPING)),   # prefer LARGER damping (less intervention) on ties
+        float(_combo_at(c, 6, INFER_FINAL_FEATURE_TEMP)),        # prefer SMALLER tau (position floor) on ties
         float(c.get("select_val_median_p95") if np.isfinite(
             c.get("select_val_median_p95", float("nan"))) else 1e9),
     ))[0]
@@ -2286,6 +2423,7 @@ def phase_select(out_root: Path, *, force: bool = False,
         "sigma_V_seed": float(_combo_at(best, 3, _SIGMA_V_SEED)),
         "blob_means_updates": int(_combo_at(best, 4, INFER_BLOB_MEANS_UPDATES)),
         "feature_update_damping": float(_combo_at(best, 5, INFER_FEATURE_UPDATE_DAMPING)),
+        "final_feature_temp": float(_combo_at(best, 6, INFER_FINAL_FEATURE_TEMP)),
         "select_val_score": float(best["select_val_score"]),
         "select_val_region_J": float(best.get("select_val_region_J", float("nan"))),
         "select_val_median_p95": float(best.get("select_val_median_p95", float("nan"))),
@@ -2301,6 +2439,8 @@ def phase_select(out_root: Path, *, force: bool = False,
          f"per_frame_sweeps={selected['num_gibbs_sweeps_per_frame']} "
          f"sigma_V_seed={selected['sigma_V_seed']:.3e} "
          f"blob_means_updates={selected['blob_means_updates']} "
+         f"feature_update_damping={selected['feature_update_damping']:.3g} "
+         f"final_feature_temp={selected['final_feature_temp']:.3g} "
          f"(SELECT_VAL composite={selected['select_val_score']:.4f}); wrote {sel_path}")
     return selected
 
@@ -2354,6 +2494,15 @@ def _infer_from_yaml_cfg(cfg: dict) -> dict:
         freeze_blob_features=bool(trk.get("freeze_blob_features", False)),
         feature_update_damping=float(trk.get("feature_update_damping",
                                              INFER_FEATURE_UPDATE_DAMPING)),
+        final_feature_temp=float(trk.get("final_feature_temp",
+                                         INFER_FINAL_FEATURE_TEMP)),
+        final_assignment_anchor=bool(trk.get("final_assignment_anchor",
+                                             INFER_FINAL_ASSIGNMENT_ANCHOR)),
+        # Read the augmentation flag FROM the (baseline) YAML, NOT the global — so the
+        # validate baseline loaded from the un-flagged shipping config stays un-augmented
+        # even when the run global --tokencut-seed-augment is ON.
+        tokencut_seed_augment=bool(trk.get("tokencut_seed_augment", False)),
+        tokencut_knobs=trk.get("tokencut_knobs"),
     )
 
 
@@ -2396,7 +2545,9 @@ def phase_validate(out_root: Path, *, force: bool = False,
                     pure_object_seed: bool = INFER_PURE_OBJECT_SEED,
                     blob_means_updates: int = INFER_BLOB_MEANS_UPDATES,
                     freeze_blob_features: bool = INFER_FREEZE_BLOB_FEATURES,
-                    feature_update_damping: float = INFER_FEATURE_UPDATE_DAMPING) -> dict:
+                    feature_update_damping: float = INFER_FEATURE_UPDATE_DAMPING,
+                    final_feature_temp: float = INFER_FINAL_FEATURE_TEMP,
+                    final_assignment_anchor: bool = INFER_FINAL_ASSIGNMENT_ANCHOR) -> dict:
     """Generalization gate on the HELD-OUT split — the ONLY place true DAVIS GT
     is read. Learning + selection (phase_em / phase_select) never saw these
     videos; all 5 demo videos are here, so their quality measures generalization.
@@ -2436,7 +2587,9 @@ def phase_validate(out_root: Path, *, force: bool = False,
                               pure_object_seed=pure_object_seed,
                               blob_means_updates=blob_means_updates,
                               freeze_blob_features=freeze_blob_features,
-                              feature_update_damping=feature_update_damping)
+                              feature_update_damping=feature_update_damping,
+                              final_feature_temp=final_feature_temp,
+                              final_assignment_anchor=final_assignment_anchor)
     # Baseline = the currently-shipping streaming_general.yaml (or inline
     # streaming_default fallback). Captured BEFORE this run's emit overwrites it.
     baseline, baseline_infer, baseline_src = _load_shipping_baseline()
@@ -2471,7 +2624,7 @@ def phase_validate(out_root: Path, *, force: bool = False,
             is_davis = (entry.kind == "davis")
             tr = _run_tracker_on_video(labels_cache[vid], yaml_cfg, max_frames_per_video,
                                        num_sweeps=num_sweeps, capture_blob_weights=True,
-                                       sam_grid=sam_grids.get(vid),
+                                       sam_grid=sam_grids.get(vid), vid=vid,
                                        capture_data_loglik=(_OBJECTIVE_MODE == "data_loglik"))
             if "error" in tr:
                 out[vid] = {"error": tr["error"], "kind": entry.kind}
@@ -2511,7 +2664,7 @@ def phase_validate(out_root: Path, *, force: bool = False,
                 # matter-weighted GT-J kept ALONGSIDE as a logged side-metric.
                 gt_jm = _score_video_jmean(vid, tr["blob_a"], tr.get("blob_w"),
                                            tr.get("n_blobs"), tr.get("indices"),
-                                           annotations_path=_davis_gt_path())
+                                           annotations_path=_davis_gt_path(vid))
                 rec["gt_matter_J"] = gt_jm["J_mean"]
                 rec["gt_matter_J_recall"] = gt_jm["J_recall"]
                 rec["gt_matter_J_precision"] = gt_jm["J_precision"]
@@ -2532,8 +2685,9 @@ def phase_validate(out_root: Path, *, force: bool = False,
 
     # GT scoring is permitted ONLY within this scope (the held-out gate). Both
     # passes score reference="gt" on the held-out DAVIS; the guard makes any GT
-    # access from learning/selection raise instead.
-    with _gt_scoring_enabled():
+    # access from learning/selection raise instead. `_heldout_gate_enabled()` is
+    # the held-out-specific lock: this gate is the one place HELD-OUT GT may be read.
+    with _gt_scoring_enabled(), _heldout_gate_enabled():
         _log(f"validate: baseline pass ({baseline_src}; 1 sweep/frame)")
         baseline_pv = _run_pass("baseline", baseline, baseline_infer, 1)
         _log("validate: chosen pass (recalibrated hypers + structure: "
@@ -2580,7 +2734,18 @@ def phase_validate(out_root: Path, *, force: bool = False,
     p95_pass = (np.isfinite(max_p95) and np.isfinite(max_p95_baseline) and
                 max_p95 <= max_p95_baseline + 0.05)
     delta_pass = (np.isfinite(median_delta) and median_delta > 0)
-    passed = bool(p95_pass and delta_pass)
+    # HARD FLOOR (no-rollback): the chosen AGGREGATE median GT-J must NOT regress
+    # below the baseline's. The per-video median DELTA can be marginally positive
+    # (a slim majority improve by a hair) while a few large regressions pull the
+    # aggregate BELOW the baseline — median-of-deltas != delta-of-medians. Emitting
+    # there would SHIP A REGRESSION, so we require BOTH the paired-delta AND the
+    # aggregate floor. (Observed: tau0.75 gave median Δ +0.0007 yet chosen 0.6780 <
+    # baseline 0.6812 — a regression that the delta-only gate let through.)
+    _chosen_med_gt = _median_metric(chosen_pv, "gt_J", "davis")
+    _baseline_med_gt = _median_metric(baseline_pv, "gt_J", "davis")
+    floor_pass = (np.isfinite(_chosen_med_gt) and np.isfinite(_baseline_med_gt)
+                  and _chosen_med_gt >= _baseline_med_gt - 1e-9)
+    passed = bool(p95_pass and delta_pass and floor_pass)
 
     # ---- Composite-vs-GT correlation KILL-SWITCH (Phase C). Measured ONCE, here,
     # inside the GT scope: does the self-supervised composite proxy track held-out
@@ -2674,8 +2839,8 @@ def phase_validate(out_root: Path, *, force: bool = False,
     }
     _save_json(info_path, info)
     _log(f"validate done: median Δ GT-J={median_delta:+.4f} over {len(deltas)} held-out DAVIS "
-         f"(GATE pass={delta_pass}); chosen GT-J={info['chosen_median_gt_J_davis']:.4f} "
-         f"vs baseline {info['baseline_median_gt_J_davis']:.4f}. "
+         f"(delta_pass={delta_pass}); chosen GT-J={info['chosen_median_gt_J_davis']:.4f} "
+         f"vs baseline {info['baseline_median_gt_J_davis']:.4f} (floor_pass={floor_pass}). "
          f"Median Δ SAM-J (held-out)={median_sam_delta:+.4f}. "
          f"chosen max p95={max_p95:.4f} vs baseline {max_p95_baseline:.4f} "
          f"(pass={p95_pass}) — overall {'PASS' if passed else 'FAIL'}")
@@ -2691,6 +2856,157 @@ def phase_validate(out_root: Path, *, force: bool = False,
              f"(n={data_loglik_gt['n']}; loglik_ok={loglik_ok}). "
              + ("" if loglik_ok else
                 "WARNING: data_loglik ANTI-correlates with GT — revert to --objective composite."))
+    return info
+
+
+def phase_validate_augmentation(out_root: Path, *, force: bool = False,
+                                max_frames_per_video: int = -1,
+                                num_gibbs_sweeps_per_frame: int = 1,
+                                heldout_videos: Optional[List[str]] = None,
+                                eps_regression: float = 0.02) -> dict:
+    """The ONE sanctioned held-out validation of the TokenCut seed augmentation —
+    the gate-routed replacement for the (deleted) ad-hoc `_tokencut_official_eval.py`.
+
+    Both passes use the SAME shipping hypers + structure; they differ by EXACTLY
+    the `tokencut_seed_augment` flag (NOT an EM re-fit — that confound already
+    failed phase_validate's strict gate). So this isolates the augmentation:
+      • baseline = shipping config, flag forced OFF (un-augmented).
+      • chosen   = shipping config, flag forced ON  (+ self-supervised knobs).
+
+    Held-out GT is read ONLY here, inside `_heldout_gate_enabled()` — the durable
+    lock makes any held-out GT access elsewhere assert. The gate criterion is the
+    one appropriate to a SPARSE additive augmentation (working/demo videos no-op
+    by construction → their Δ is 0, so a median-of-Δ gate is ill-posed):
+        floor (chosen median GT-J ≥ baseline)
+        ∧ no held-out regression worse than `eps_regression`
+        ∧ mean Δ GT-J > 0.
+    Emits nothing (the shipping config already carries the flag); on PASS it
+    confirms the number through the lock, on FAIL it WARNs. Writes
+    `validate_augmentation.json` + `augmentation_report.md`."""
+    _assert_split_discipline()
+    info_path = out_root / "validate_augmentation.json"
+    cached = _load_json(info_path)
+    if cached and not force:
+        _log("validate_augmentation: reusing cached")
+        return cached
+
+    # Shipping hypers + structure (the honest 'before'); we toggle ONLY the flag.
+    em, infer, src = _load_shipping_baseline()
+    knobs = infer.get("tokencut_knobs")
+    if not knobs:
+        kp = OUT_ROOT / "tokencut_knobs.json"
+        if kp.is_file():
+            knobs = json.loads(kp.read_text())
+        else:
+            import tokencut
+            knobs = dict(tokencut.DEFAULT_KNOBS)
+    base_infer = {**infer, "tokencut_seed_augment": False, "tokencut_knobs": None}
+    chosen_infer = {**infer, "tokencut_seed_augment": True, "tokencut_knobs": knobs}
+    _log(f"validate_augmentation: baseline={src} (flag OFF) vs SAME hypers (flag ON); "
+         f"knobs={knobs}")
+
+    _ensure_jax_setup()
+    videos = discover_videos()
+    held_set = set(heldout_videos) if heldout_videos is not None else set(HELDOUT_VIDEOS)
+    labels_cache: Dict[str, dict] = {}
+    for vid in videos:
+        if vid not in held_set or videos[vid].kind != "davis":
+            continue   # held-out DAVIS only (locals have no GT)
+        if (LABELS_DIR / f"{vid}.npz").is_file():
+            try:
+                labels_cache[vid] = _load_labels(vid)
+            except Exception as e:
+                _log(f"validate_augmentation: failed to load {vid}: {e}")
+    sam_grids = _build_sam_grids(videos, labels_cache, chosen_infer["use_sam_frame0"])
+    _log(f"validate_augmentation: held-out DAVIS gate over {len(labels_cache)} videos")
+
+    def _pass(label: str, infer_d: dict) -> Dict[str, dict]:
+        yaml_cfg = _make_yaml_cfg(em, infer_d)
+        out: Dict[str, dict] = {}
+        for j, vid in enumerate(labels_cache, 1):
+            tr = _run_tracker_on_video(labels_cache[vid], yaml_cfg, max_frames_per_video,
+                                       num_sweeps=num_gibbs_sweeps_per_frame,
+                                       capture_blob_weights=True,
+                                       sam_grid=sam_grids.get(vid), vid=vid)
+            if "error" in tr:
+                out[vid] = {"error": tr["error"]}
+                _log(f"validate_augmentation[{label}][{j}/{len(labels_cache)}] {vid}: FAILED")
+                continue
+            gt = _score_video_region_J(vid, tr["hyperblob_a"], tr.get("indices"),
+                                       labels_cache[vid], reference="gt")
+            out[vid] = {"gt_J": gt["region_J"], "outlier_frac_p95": tr["outlier_frac_p95"]}
+            _log(f"validate_augmentation[{label}][{j}/{len(labels_cache)}] {vid}: "
+                 f"GT-region-J={gt['region_J']:.4f}")
+        return out
+
+    # The ONE held-out GT read, behind both the GT scope and the held-out lock.
+    with _gt_scoring_enabled(), _heldout_gate_enabled():
+        base_pv = _pass("OFF", base_infer)
+        chosen_pv = _pass("ON", chosen_infer)
+
+    rows = []
+    for vid in labels_cache:
+        b, c = base_pv.get(vid, {}), chosen_pv.get(vid, {})
+        if np.isfinite(b.get("gt_J", np.nan)) and np.isfinite(c.get("gt_J", np.nan)):
+            rows.append((vid, float(b["gt_J"]), float(c["gt_J"])))
+    if not rows:
+        raise RuntimeError("validate_augmentation: no held-out DAVIS scored")
+    off = np.array([r[1] for r in rows]); on = np.array([r[2] for r in rows])
+    delta = on - off
+    median_off, median_on = float(np.median(off)), float(np.median(on))
+    mean_delta = float(np.mean(delta)); worst = float(np.min(delta))
+    floor_pass = median_on >= median_off - 1e-9
+    no_regression = worst >= -eps_regression
+    mean_pass = mean_delta > 0
+    passed = bool(floor_pass and no_regression and mean_pass)
+
+    worst_vid = rows[int(np.argmin(delta))][0]
+    best_i = int(np.argmax(delta))
+    info = {
+        "phase": "validate_augmentation",
+        "baseline_source": src, "knobs": knobs,
+        "num_gibbs_sweeps_per_frame": num_gibbs_sweeps_per_frame,
+        "eps_regression": eps_regression,
+        "n_davis": len(rows),
+        "per_video": {v: {"off": o, "on": n, "delta": n - o} for v, o, n in rows},
+        "median_off": median_off, "median_on": median_on,
+        "mean_delta": mean_delta, "worst_delta": worst, "worst_video": worst_vid,
+        "best_delta": float(delta[best_i]), "best_video": rows[best_i][0],
+        "floor_pass": floor_pass, "no_regression_pass": no_regression,
+        "mean_pass": mean_pass, "passed": passed,
+        "n_up": int((delta > 1e-4).sum()), "n_down": int((delta < -1e-4).sum()),
+        "n_flat": int((np.abs(delta) <= 1e-4).sum()),
+    }
+    _save_json(info_path, info)
+
+    md = ["# TokenCut seed-augmentation — sanctioned held-out validation", "",
+          "Augmentation-only A/B (same shipping hypers; differ ONLY by the "
+          "`tokencut_seed_augment` flag). Held-out GT read once, inside the locked "
+          "gate (`_heldout_gate_enabled`). Gate = floor ∧ no-regression(ε="
+          f"{eps_regression}) ∧ mean Δ>0 (the criterion for a sparse additive "
+          "augmentation; working/demo videos no-op → Δ=0).", "",
+          f"- baseline source: `{src}`",
+          f"- knobs (self-supervised, TRAIN-selected): `{knobs}`",
+          f"- held-out DAVIS scored: {len(rows)}  "
+          f"(up {info['n_up']} / down {info['n_down']} / bit-flat {info['n_flat']})",
+          f"- median GT region-J: OFF {median_off:.4f} → ON {median_on:.4f}  "
+          f"(floor_pass={floor_pass})",
+          f"- mean Δ GT region-J: {mean_delta:+.4f}  (mean_pass={mean_pass})",
+          f"- worst Δ: {worst:+.4f} ({worst_vid})  (no_regression_pass={no_regression})",
+          f"- best Δ: {info['best_delta']:+.4f} ({info['best_video']})",
+          f"- **gate: {'PASS' if passed else 'FAIL'}**", "",
+          "| video | OFF | ON | Δ |", "|---|---|---|---|"]
+    for v, o, n in sorted(rows, key=lambda r: (r[2] - r[1])):
+        md.append(f"| {v} | {o:.4f} | {n:.4f} | {n - o:+.4f} |")
+    (out_root / "augmentation_report.md").write_text("\n".join(md) + "\n")
+
+    _log(f"validate_augmentation done: median OFF={median_off:.4f} → ON={median_on:.4f} "
+         f"(floor={floor_pass}); mean Δ={mean_delta:+.4f} (mean_pass={mean_pass}); "
+         f"worst Δ={worst:+.4f} @{worst_vid} (no_regression={no_regression}) — "
+         f"{'PASS' if passed else 'FAIL'}")
+    if not passed:
+        _log("validate_augmentation: gate FAILED — the shipping config's flag is NOT "
+             "reconfirmed; investigate before relying on the augmentation.")
     return info
 
 
@@ -2756,6 +3072,8 @@ def _emit_yaml(out_path: Path, *, val_info: dict, em_info: dict) -> None:
         f"#   use_calibrated_priors      = {chosen_em.use_calibrated_priors}",
         f"#   feature_update_damping     = {infer.get('feature_update_damping', INFER_FEATURE_UPDATE_DAMPING):.4f}  "
         f"(Phase-A anti-drift; d=0 freeze .. d=1 vendored; SELECTED self-supervised)",
+        f"#   final_feature_temp         = {infer.get('final_feature_temp', INFER_FINAL_FEATURE_TEMP):.4f}  "
+        f"(Phase-1 inference; tau=1 vendored feat-aware .. tau>1 feature-driven; SELECTED self-supervised)",
         "#",
         "# HELD-OUT validation (chosen = this config; baseline = previously-shipping):",
         f"#   real DAVIS GT region-J: chosen {chosen_gt:.4f} vs baseline {base_gt:.4f} "
@@ -3169,10 +3487,11 @@ def _run_with_retry(name: str, fn, *args, retries: int = 1, **kwargs):
 
 def main(argv: Optional[List[str]] = None) -> int:
     global _OBJECTIVE_MODE, _DATA_LOGLIK_VARIANT   # set from --objective / --data-loglik-variant below
+    global INFER_TOKENCUT_SEED_AUGMENT, INFER_TOKENCUT_KNOBS  # set from --tokencut-seed-augment
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--phase", required=True,
                    choices=("preflight", "pseudo_labels", "select", "em", "validate",
-                            "render_local", "plumbing_smoke", "all"))
+                            "validate_augmentation", "render_local", "plumbing_smoke", "all"))
     p.add_argument("--force", action="store_true",
                    help="Recompute even if a cached phase JSON exists.")
     p.add_argument("--out", type=str, default=str(OUT_ROOT))
@@ -3245,6 +3564,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="phase_select feature_update_damping grid (comma-separated). "
                         "Pass e.g. '0.0,0.25,0.5,1.0' to SELECT the Phase-A anti-drift "
                         "damping self-supervised on TRAIN (d=0 freeze .. d=1 vendored).")
+    p.add_argument("--select-final-feature-temp", type=str,
+                   default=f"{INFER_FINAL_FEATURE_TEMP:g}",
+                   help="phase_select final_feature_temp grid (comma-separated). Pass "
+                        "e.g. '1,2,4,8' to SELECT the Phase-1 inference feature temperature "
+                        "self-supervised on TRAIN (tau=1 vendored feat-aware .. tau>1 "
+                        "feature-driven). Capped (no feat_only) = a position floor.")
     p.add_argument("--select-em-iters", type=int, default=2,
                    help="Short-EM iters per phase_select grid combo.")
     # ---- Self-supervised objective (the EM/accept/select score; the GT gate is
@@ -3264,15 +3589,39 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--feature-update-damping", type=float, default=None,
                    help="Override the em/validate Phase-A anti-drift damping (d=0 freeze .. "
                         "d=1 vendored). Default: the phase_select-chosen value, else 1.0.")
+    p.add_argument("--final-feature-temp", type=float, default=None,
+                   help="Override the em/validate Phase-1 final-assignment feature temperature "
+                        "(tau=1 vendored feat-aware .. tau>1 feature-driven). Default: the "
+                        "phase_select-chosen value, else 1.0.")
+    p.add_argument("--final-assignment-anchor", action="store_true",
+                   help="Score the re-impl final feature term vs the FROZEN frame-0 anchor "
+                        "(no-op at damping d=0; pairs with Phase-2 drift).")
     p.add_argument("--sigma-v-seed", type=float, default=None,
                    help="Override the EM initial sigma_V seed (the motion velocity-prior "
                         "variance). Default: DAVIS_DINO_DEFAULTS / the phase_select-chosen seed.")
+    p.add_argument("--tokencut-seed-augment", action="store_true",
+                   help="Enable TokenCut self-supervised seed augmentation for the WHOLE "
+                        "pipeline (learn-under + select-under + validate-chosen). Self-supervised "
+                        "(no GT); knobs from runs/.../tokencut_knobs.json (or tokencut.DEFAULT_KNOBS). "
+                        "Augmented grids are disk-cached so the EM stays fast.")
     args = p.parse_args(argv)
 
     # The self-supervised objective + loglik variant are process-wide modes
     # (mirror _GT_SCORING_ALLOWED).
     _OBJECTIVE_MODE = args.objective
     _DATA_LOGLIK_VARIANT = args.data_loglik_variant
+    # TokenCut seed augmentation is a process-wide mode too (set the module globals
+    # _infer_cfg reads at call time → EM / select / validate-chosen all build cfgs
+    # under it; the shipping-baseline infer is built separately and stays off).
+    if args.tokencut_seed_augment:
+        INFER_TOKENCUT_SEED_AUGMENT = True
+        _knobs_path = OUT_ROOT / "tokencut_knobs.json"
+        if _knobs_path.is_file():
+            INFER_TOKENCUT_KNOBS = json.loads(_knobs_path.read_text())
+            _log(f"TokenCut seed augmentation ON; knobs from {_knobs_path}: {INFER_TOKENCUT_KNOBS}")
+        else:
+            _log(f"TokenCut seed augmentation ON; knobs file {_knobs_path} missing → "
+                 f"tokencut.DEFAULT_KNOBS")
 
     out_root = Path(args.out).resolve()
     out_root.mkdir(parents=True, exist_ok=True)
@@ -3289,6 +3638,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                         blob_means_updates=args.blob_means_updates)
     if args.feature_update_damping is not None:
         infer_kwargs["feature_update_damping"] = float(args.feature_update_damping)
+    if args.final_feature_temp is not None:
+        infer_kwargs["final_feature_temp"] = float(args.final_feature_temp)
+    if args.final_assignment_anchor:
+        infer_kwargs["final_assignment_anchor"] = True
     num_sweeps = args.num_gibbs_sweeps_per_frame
     sigma_v_seed = args.sigma_v_seed   # None unless overridden / selected below
     # phase_select (if it ran) is AUTHORITATIVE for the global scalar tuple
@@ -3303,6 +3656,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                                                           infer_kwargs["blob_means_updates"]))
         if "feature_update_damping" in sel and args.feature_update_damping is None:
             infer_kwargs["feature_update_damping"] = float(sel["feature_update_damping"])
+        if "final_feature_temp" in sel and args.final_feature_temp is None:
+            infer_kwargs["final_feature_temp"] = float(sel["final_feature_temp"])
         num_sweeps = int(sel["num_gibbs_sweeps_per_frame"])
         if sigma_v_seed is None and "sigma_V_seed" in sel:
             sigma_v_seed = float(sel["sigma_V_seed"])
@@ -3311,6 +3666,7 @@ def main(argv: Optional[List[str]] = None) -> int:
              f"per_frame_sweeps={num_sweeps} "
              f"blob_means_updates={infer_kwargs['blob_means_updates']} "
              f"feature_update_damping={infer_kwargs.get('feature_update_damping', INFER_FEATURE_UPDATE_DAMPING)} "
+             f"final_feature_temp={infer_kwargs.get('final_feature_temp', INFER_FINAL_FEATURE_TEMP)} "
              f"sigma_V_seed={sigma_v_seed} (self-supervised, TRAIN)")
 
     # render_all_local's signature takes only the original 4 inference knobs; the
@@ -3336,6 +3692,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         "blob_means_updates": [int(x) for x in args.select_blob_means_updates.split(",") if x.strip()],
         "feature_update_damping": [float(x) for x in
                                    args.select_feature_update_damping.split(",") if x.strip()],
+        "final_feature_temp": [float(x) for x in
+                               args.select_final_feature_temp.split(",") if x.strip()],
     }
 
     if args.phase == "preflight":
@@ -3378,6 +3736,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         em_info = _load_json(out_root / "em.json") or {}
         _emit_configs(out_root, val_info=val_info, em_info=em_info)
         return 0 if val_info.get("passed", False) else 2
+    if args.phase == "validate_augmentation":
+        # The ONE sanctioned, gate-routed held-out A/B of the seed augmentation
+        # (replaces the deleted ad-hoc _tokencut_official_eval.py). No emit — the
+        # shipping config already carries the flag; this reconfirms it through the lock.
+        # Runs at the SHIPPING / live sweep depth (1), NOT the 25-sweep calibration
+        # depth, so the number matches what deploys (the streaming demo always uses 1).
+        aug_info = phase_validate_augmentation(out_root, force=args.force,
+                                               max_frames_per_video=args.max_frames_per_video,
+                                               num_gibbs_sweeps_per_frame=1,
+                                               heldout_videos=list(HELDOUT_VIDEOS))
+        return 0 if aug_info.get("passed", False) else 2
     if args.phase == "render_local":
         _do_render()
         return 0
@@ -3401,6 +3770,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                                                           infer_kwargs["blob_means_updates"]))
         if "feature_update_damping" in sel and args.feature_update_damping is None:
             infer_kwargs["feature_update_damping"] = float(sel["feature_update_damping"])
+        if "final_feature_temp" in sel and args.final_feature_temp is None:
+            infer_kwargs["final_feature_temp"] = float(sel["final_feature_temp"])
         num_sweeps = int(sel["num_gibbs_sweeps_per_frame"])
         if sigma_v_seed is None and "sigma_V_seed" in sel:
             sigma_v_seed = float(sel["sigma_V_seed"])

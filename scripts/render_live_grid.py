@@ -280,12 +280,18 @@ def render_video(vid: str, out_path: Path, *, yaml_cfg: dict, num_sweeps: int,
     _damp_raw = _trk.get("feature_update_damping", None)
     feature_update_damping = float(_damp_raw) if _damp_raw is not None else None
     use_damp = (feature_update_damping is not None) and (feature_update_damping < 1.0)
+    # Phase-1 inference feature-temperature (tau) on the final assignment.
+    _tau_raw = _trk.get("final_feature_temp", None)
+    use_feature_temp_final = (_tau_raw is not None)
+    final_feature_temp = float(_tau_raw) if _tau_raw is not None else 1.0
+    final_assignment_anchor = bool(_trk.get("final_assignment_anchor", False))
+    _need_anchor = use_damp or (use_feature_temp_final and final_assignment_anchor)
     blob_feat_anchor = None
     hb_feat_anchor = None
     _log(f"{vid}: src={Path(src).name} seed={seed_kind} num_blobs={nb} "
          f"feat_final={feat_final} final_outlier={final_outlier} freeze_hb={freeze_hb} "
          f"blob_means_updates={blob_means_updates} freeze_blob_features={freeze_blob_features} "
-         f"feature_update_damping={feature_update_damping}")
+         f"feature_update_damping={feature_update_damping} final_feature_temp={final_feature_temp}")
 
     import jax
     raw_frames = sum(1 for _ in live.iter_frames(Path(src), max_frames))
@@ -347,8 +353,9 @@ def render_video(vid: str, out_path: Path, *, yaml_cfg: dict, num_sweeps: int,
             # every loop seam (see the is_seam branch above).
             seed_state = state
             # Capture the frame-0 appearance anchor for the damped feature update
-            # (the seam re-seed restores seed_state, so this anchor stays valid).
-            if use_damp:
+            # / anchor-referenced final assignment (the seam re-seed restores
+            # seed_state, so this anchor stays valid).
+            if _need_anchor:
                 import jax.numpy as _jnp
                 blob_feat_anchor = _jnp.asarray(state.blobs_state.blob_features)
                 hb_feat_anchor = _jnp.asarray(state.hyperblobs_state.hyperblob_features)
@@ -357,6 +364,9 @@ def render_video(vid: str, out_path: Path, *, yaml_cfg: dict, num_sweeps: int,
             feature_aware_final=feat_final, final_outlier=final_outlier,
             freeze_hyperblob_assignment=freeze_hb,
             blob_means_updates=blob_means_updates,
+            use_feature_temp_final=use_feature_temp_final,
+            final_feature_temp=final_feature_temp,
+            final_assignment_anchor=final_assignment_anchor,
             freeze_blob_features=freeze_blob_features,
             blob_feat_anchor=blob_feat_anchor,
             hb_feat_anchor=hb_feat_anchor,

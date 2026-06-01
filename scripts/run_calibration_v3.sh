@@ -62,6 +62,13 @@ LL_VARIANT="${DATA_LOGLIK_VARIANT:-}"
 [ -n "$SELECT_FUD" ] && EXTRA_ARGS+=( --select-feature-update-damping "$SELECT_FUD" )
 [ -n "$FUD" ] && EXTRA_ARGS+=( --feature-update-damping "$FUD" )
 [ -n "$LL_VARIANT" ] && EXTRA_ARGS+=( --data-loglik-variant "$LL_VARIANT" )
+# Phase-1 inference feature-temperature (tau) knobs.
+#   SELECT_FINAL_FEATURE_TEMP=1,2,4,8  -> SELECT tau self-sup on TRAIN (capped = position floor)
+#   FINAL_FEATURE_TEMP=4               -> pin the em/validate tau (skip the select axis)
+SELECT_FFT="${SELECT_FINAL_FEATURE_TEMP:-}"
+FFT="${FINAL_FEATURE_TEMP:-}"
+[ -n "$SELECT_FFT" ] && EXTRA_ARGS+=( --select-final-feature-temp "$SELECT_FFT" )
+[ -n "$FFT" ] && EXTRA_ARGS+=( --final-feature-temp "$FFT" )
 
 mkdir -p "$RUN_DIR"
 

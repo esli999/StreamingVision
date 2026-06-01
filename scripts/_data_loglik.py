@@ -34,10 +34,49 @@ the vendored complete-data density exactly (verified in the proto).
 """
 from __future__ import annotations
 
+import numpy as _np
 import jax
 import jax.numpy as jnp
 from jax.scipy.stats import multivariate_normal as _mvn
 from jax.scipy.stats import norm as _norm
+
+
+def instance_purity_meanll(blob_a, z_sam, eps: float = 1e-6) -> float:
+    """Mean per-datapoint instance-PURITY log-likelihood (HOST-SIDE numpy).
+
+    Phase-3 self-supervised objective term, from the temporally-consistent SAM
+    instances (``Z_sam``) — NOT the polluted union, NOT GT.  For each blob b,
+    ``theta_b[k]`` is the empirical fraction of b's datapoints whose SAM instance is
+    k (the MLE instance distribution of blob b; background ``z_sam==0`` is its own
+    bucket).  The per-datapoint term is ``log theta_{b_n, z_sam_n}`` and we return
+    its mean over inlier datapoints.
+
+    It is MAXIMISED (-> 0) when every blob maps to exactly ONE instance, and a blob
+    that BLEEDS across instances scores ``log(fraction) < 0`` — a probabilistic,
+    differentiable analog of the discrete ``_instance_matched_J`` (calibrate_
+    consistency.py).  Unlike the anchor feature term (which is freeze-conservative),
+    purity credits any partition that keeps instances separate REGARDLESS of
+    appearance drift, so it can reward a beneficial slow drift the anchor term cannot.
+
+    ``blob_a``: (N,) int blob id (>=0; -1 = outlier, excluded).  ``z_sam``: (N,) int
+    SAM instance id (0 = background)."""
+    z = _np.asarray(blob_a).reshape(-1)
+    zs = _np.asarray(z_sam).reshape(-1)
+    m = (z >= 0)
+    if not m.any():
+        return float("nan")
+    z = z[m]
+    zs = zs[m]
+    # Relabel instance ids to a dense [0, K) range (K static per frame, host-side).
+    _uniq, zs_idx = _np.unique(zs, return_inverse=True)
+    K = int(_uniq.size)
+    L = int(z.max()) + 1
+    flat = z * K + zs_idx                                  # (M,) joint (blob, instance)
+    counts = _np.bincount(flat, minlength=L * K).reshape(L, K).astype(_np.float64)
+    totals = counts.sum(axis=1, keepdims=True)             # (L,1) per-blob datapoint count
+    theta = counts / _np.maximum(totals, 1.0)              # (L,K) MLE instance dist
+    ll = _np.log(theta[z, zs_idx] + eps)                   # (M,) log theta at each datapoint
+    return float(_np.mean(ll))
 
 
 def per_datapoint_terms(state, anchor_blob_feat=None):

@@ -80,11 +80,23 @@ def main(argv=None) -> int:
     ap.add_argument("--config", default="configs/streaming_general_premotion.yaml")
     ap.add_argument("--set", choices=["heldout", "dev", "demos"], default="heldout")
     ap.add_argument("--videos", nargs="+", default=None)
+    ap.add_argument("--sweep", choices=["damping", "tau"], default="damping",
+                    help="Which inference axis to sweep to induce GT variation. "
+                         "'damping' (Phase-A feature_update_damping) | 'tau' (Phase-1 "
+                         "final_feature_temp). For 'tau' pass --config the CURRENT SHIP.")
     ap.add_argument("--dampings", nargs="+", type=float,
                     default=[0.0, 0.25, 0.5, 0.75, 1.0])
+    ap.add_argument("--taus", nargs="+", type=float, default=[1.0, 2.0, 4.0, 8.0],
+                    help="final_feature_temp grid when --sweep tau (capped = position floor).")
     ap.add_argument("--drift-schedule", action="store_true", default=True,
                     help="apply init_gibbs_sweeps=1 + blob_means_updates=1 (the shipped anti-drift schedule)")
     args = ap.parse_args(argv)
+    # The swept axis -> (cfg tracking key, value list). tau layers on the ship (which
+    # already carries the drift schedule), so drift_schedule is only applied for damping.
+    if args.sweep == "tau":
+        sweep_key = "final_feature_temp"; sweep_vals = list(args.taus)
+    else:
+        sweep_key = "feature_update_damping"; sweep_vals = list(args.dampings)
 
     cc._ensure_jax_setup(); cc._GT_SCORING_ALLOWED = True
     if not _verify_math():
@@ -104,13 +116,15 @@ def main(argv=None) -> int:
     # NAIVE live-feature variants (expected to ANTI-correlate — reward drift) +
     # ANCHOR-referenced variants (the fix — expected to TRACK GT).
     VARIANTS = ["full", "pos_feat", "feat", "pos", "vel", "mix",
-                "feat_anchor", "anchor_pos_feat", "anchor_full"]
+                "feat_anchor", "anchor_pos_feat", "anchor_full",
+                # Phase-3 instance-purity (present only when the tracker captured Z_sam):
+                "inst_purity", "anchor_pos_feat_purity"]
     # grid rows: each (vid, damping) -> {variant: loglik, "gt": region_J}
     rows = []
-    per_vid = {}   # vid -> {damping: {variant:.., gt:..}}
-    print(f"[loglik_proto] set={args.set} ({len(vids)} vids) dampings={args.dampings} "
-          f"drift_schedule={args.drift_schedule}", flush=True)
-    hdr = f"  {'video':16s} {'damp':>5s}  " + " ".join(f"{v[:8]:>8s}" for v in VARIANTS) + f" {'GT':>6s}"
+    per_vid = {}   # vid -> {sweep_val: {variant:.., gt:..}}
+    print(f"[loglik_proto] set={args.set} ({len(vids)} vids) sweep={args.sweep} "
+          f"vals={sweep_vals} drift_schedule={args.drift_schedule and args.sweep=='damping'}", flush=True)
+    hdr = f"  {'video':16s} {args.sweep[:5]:>5s}  " + " ".join(f"{v[:8]:>8s}" for v in VARIANTS) + f" {'GT':>6s}"
     print(hdr, flush=True)
     for vid in vids:
         npz = cc.LABELS_DIR / f"{vid}.npz"
@@ -123,25 +137,25 @@ def main(argv=None) -> int:
         gt_dp = [cc._gt_dp_at_datapoints(vid, int(fi[t]), idx) for t in range(Tz)]
         sam_grid = cc._frame0_sam_grid(disc[vid], labels)
         per_vid[vid] = {}
-        for dmp in args.dampings:
+        for sval in sweep_vals:
             cfg = copy.deepcopy(base)
-            cfg["tracking"]["feature_update_damping"] = float(dmp)
-            if args.drift_schedule:
+            cfg["tracking"][sweep_key] = float(sval)
+            if args.drift_schedule and args.sweep == "damping":
                 cfg["tracking"]["init_gibbs_sweeps"] = 1
                 cfg["tracking"]["blob_means_updates_per_frame"] = 1
             tr = cc._run_tracker_on_video(labels, cfg, -1, num_sweeps=1,
                                           capture_blob_weights=False, sam_grid=sam_grid,
                                           capture_data_loglik=True)
             if "error" in tr:
-                print(f"  {vid:16s} {dmp:5.2f}  ERR {tr['error'][:40]}"); continue
+                print(f"  {vid:16s} {sval:5.2f}  ERR {tr['error'][:40]}"); continue
             hb = tr["hyperblob_a"]; Tc = min(hb.shape[0], Tz)
             gt_j = _region_j(hb, lambda t: gt_dp[t], Tc)
             terms = tr.get("data_loglik_terms", {})
             row = {v: float(terms.get(v, float("nan"))) for v in VARIANTS}
             row["gt"] = gt_j
-            rows.append(row); per_vid[vid][dmp] = row
+            rows.append(row); per_vid[vid][sval] = row
             cells = " ".join(f"{row[v]:8.2f}" for v in VARIANTS)
-            print(f"  {vid:16s} {dmp:5.2f}  {cells} {gt_j:6.3f}", flush=True)
+            print(f"  {vid:16s} {sval:5.2f}  {cells} {gt_j:6.3f}", flush=True)
 
     from scipy.stats import pearsonr, spearmanr
     g = np.asarray([r["gt"] for r in rows])
@@ -169,12 +183,12 @@ def main(argv=None) -> int:
             within[v] = float(np.nanmean(srs))
             print(f"  {v:10s} mean_within_spearman={np.nanmean(srs):+.3f} (n={len(srs)})", flush=True)
 
-    print("\n=== SELECTION SIM: argmax-damping by median(variant) vs median(GT) ===", flush=True)
+    print(f"\n=== SELECTION SIM: argmax-{args.sweep} by median(variant) vs median(GT) ===", flush=True)
     damps = sorted({d for dd in per_vid.values() for d in dd})
     med_gt = {d: np.nanmedian([per_vid[v][d]["gt"] for v in per_vid if d in per_vid[v]]) for d in damps}
     gt_best = max(med_gt, key=med_gt.get)
-    print(f"  median GT per damping: " + " ".join(f"{d:.2f}:{med_gt[d]:.3f}" for d in damps)
-          + f"   -> GT-best damping = {gt_best:.2f}", flush=True)
+    print(f"  median GT per {args.sweep}: " + " ".join(f"{d:.2f}:{med_gt[d]:.3f}" for d in damps)
+          + f"   -> GT-best {args.sweep} = {gt_best:.2f}", flush=True)
     agree = {}
     for v in VARIANTS:
         med_v = {d: np.nanmedian([per_vid[vid][d][v] for vid in per_vid if d in per_vid[vid]]) for d in damps}
