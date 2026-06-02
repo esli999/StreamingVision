@@ -190,6 +190,15 @@ def _load_flow_model(device: str = DEVICE):
                                 args=sea_args).to(device).eval()
 
 
+# NOTE (perf, 2026-06-01): torch.compile + cudnn.benchmark were benchmarked here
+# and REJECTED. The depth / DINO ViTs are matmul-bound (cudnn.benchmark is a
+# no-op) and the torch forwards are already only ~22 ms total; worse, enabling
+# torch.compile AND cudnn.benchmark together makes the co-resident JAX Gibbs
+# tracker 2.5x slower (43->108 ms) because the expanded torch GPU footprint
+# starves XLA at XLA_PYTHON_CLIENT_MEM_FRACTION=0.25. The real cost is the JAX
+# tracker, which torch compilation cannot touch. See scripts/bench_perception.py.
+
+
 print("loading models...")
 depth_proc, depth_model = _load_depth_model(DEVICE)
 flow_model = _load_flow_model(DEVICE)
@@ -532,6 +541,12 @@ class MatterWorker(threading.Thread):
         # can distinguish "tons of outliers in the viz" (NN-fill artifact) from
         # "tons of real Gibbs outliers" (hyperparam / wraparound issue).
         self._outlier_history: List[float] = []
+        # Honest FPS accounting: the matter worker runs the Gibbs tracker AND then
+        # draws 8 debug tiles before publishing, so its raw publish rate conflates
+        # INFERENCE + RENDER. Track the two separately so the sidebar can show the
+        # tracker's TRUE rate as the headline and render as its own line.
+        self._infer_ms_hist: deque = deque(maxlen=30)
+        self._render_ms_hist: deque = deque(maxlen=30)
         self._last_loop_idx = 0
         # Pointcloud focal length is auto-fit on the first matter frame and
         # then FROZEN — recomputing it per frame makes the cloud jitter
@@ -616,6 +631,9 @@ class MatterWorker(threading.Thread):
                             freeze_hyperblob_assignment=self._freeze_hyperblob_assignment)
                     self._state.datapoints_state.blob_assignments.block_until_ready()
 
+                # End of INFERENCE (the Gibbs step). Everything below is rendering
+                # the debug tiles — timed separately so the FPS counter is honest.
+                t_infer = time.monotonic()
                 blob_a, hyperblob_a = genmatter_rt.extract_assignments(self._state)
 
                 # Diagnostic probe: outlier fraction this frame + loop-wrap marker.
@@ -675,6 +693,8 @@ class MatterWorker(threading.Thread):
                     sigma_scale=0.6)
 
                 t1 = time.monotonic()
+                self._infer_ms_hist.append((t_infer - t0) * 1000.0)
+                self._render_ms_hist.append((t1 - t_infer) * 1000.0)
                 self.out.publish(
                     payload={
                         "clusters":              clusters_bgr,
@@ -694,7 +714,9 @@ class MatterWorker(threading.Thread):
                     wall_start=t0, wall_complete=t1, latency=t1-t0,
                     extras={"depth_global_id":    ds.source_global_id,
                             "flow_global_id":     fs.source_global_id,
-                            "features_global_id": ftsn.source_global_id},
+                            "features_global_id": ftsn.source_global_id,
+                            "infer_ms":  float(np.median(self._infer_ms_hist)),
+                            "render_ms": float(np.median(self._render_ms_hist))},
                     error=None,
                 )
             except Exception as e:
@@ -789,13 +811,27 @@ def _perf_sidebar(slots, trackers, t_rec_start, source_thread, total_fps,
     rs = slots["rgb"].snapshot()
     now = time.monotonic()
 
-    # Header: TOTAL FPS
-    cv2.putText(img, "TOTAL FPS", (W//2 - 80, 30),
+    # Header: TRACKER FPS — the model's TRUE inference rate (the Gibbs step only),
+    # NOT the matter worker's raw publish rate. The matter worker also draws 8
+    # debug tiles before publishing, so its publish rate (``total_fps``) is
+    # gibbs+render; we surface gibbs / render / the actual output rate as their
+    # own line below so the headline reflects the tracker and nothing is hidden.
+    mex = (slots["matter"].snapshot().extras) or {}
+    infer_ms  = float(mex.get("infer_ms", 0.0) or 0.0)
+    render_ms = float(mex.get("render_ms", 0.0) or 0.0)
+    tracker_fps = (1000.0 / infer_ms) if infer_ms > 0 else total_fps
+    cv2.putText(img, "TRACKER FPS", (W//2 - 95, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180, 180, 180), 1, cv2.LINE_AA)
-    big = f"{total_fps:4.1f}"
+    big = f"{tracker_fps:4.1f}"
     (tw, th), _ = cv2.getTextSize(big, cv2.FONT_HERSHEY_SIMPLEX, 2.4, 5)
     cv2.putText(img, big, (W//2 - tw//2, 100),
                 cv2.FONT_HERSHEY_SIMPLEX, 2.4, (60, 255, 255), 5, cv2.LINE_AA)
+    # Inference vs render vs actual output, broken out so the counter is honest:
+    # the tracker runs at TRACKER FPS; the on-screen 8-tile render adds render_ms,
+    # so the matter worker actually emits frames at `out`.
+    sub = f"gibbs {infer_ms:4.0f}ms  render {render_ms:4.0f}ms  out {total_fps:4.1f}fps"
+    cv2.putText(img, sub, (W//2 - 150, 124),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
 
     # Recorder wall-clock (informational).
     rec_elapsed = now - t_rec_start if t_rec_start else 0.0

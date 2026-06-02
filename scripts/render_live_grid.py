@@ -57,6 +57,7 @@ MAX_SAM_CLUSTERS = int(os.environ.get("MAX_SAM_CLUSTERS", "14"))
 DEFAULT_VIDEOS = ["car-roundabout", "car-shadow", "blackswan", "judo", "wine_swirl"]
 _DAVIS_GT = _REPO / "assets/tapvid_davis_30_videos_processed/tapvid_davis_segmasks"
 _DAVIS_SRC = _REPO / "runs/calibrate_consistency/_davis_src"
+_DAVIS_FRAMES = _REPO / "assets/tapvid_davis_30_videos_processed/tapvid_davis_rgb_frames"
 _CUSTOM = _REPO / "assets/custom_videos"
 
 
@@ -69,7 +70,14 @@ def _resolve(vid: str):
     gt = _DAVIS_GT / vid / "00000.png"
     if gt.is_file():
         src = _DAVIS_SRC / f"{vid}.mp4"
-        return (src if src.is_file() else None), gt, True
+        if src.is_file():
+            return src, gt, True
+        # Fallback: most held-out DAVIS clips have no pre-cut mp4, only an
+        # RGB-frames dir — live.iter_frames reads a directory just like an mp4,
+        # so the renderer reaches all 14 videos. mp4 keeps precedence above, so
+        # the mp4-backed demos resolve (and render) byte-identically.
+        frames = _DAVIS_FRAMES / vid
+        return (frames if frames.is_dir() else None), gt, True
     base = _CUSTOM / vid
     for ext in ("source.mp4", "source.mov", "source.MOV"):
         if (base / ext).is_file():
@@ -236,7 +244,7 @@ def render_video(vid: str, out_path: Path, *, yaml_cfg: dict, num_sweeps: int,
                  max_frames: int = -1, target_duration: float = 0.0,
                  out_fps: float = 30.0, frame_stride: int = 1) -> dict:
     src, mask_path, is_gt = _resolve(vid)
-    if src is None or not Path(src).is_file():
+    if src is None or not Path(src).exists():   # exists(): src may be an RGB-frames dir
         return {"vid": vid, "status": "no_source"}
     stride, n_keep = genmatter_rt.STRIDE, genmatter_rt.N_KEEP
     H, W = live.WORK_HW

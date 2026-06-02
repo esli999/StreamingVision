@@ -1917,6 +1917,219 @@ def compute_blob_color_lut(blob_assignments: np.ndarray, indices: np.ndarray,
     return lut.clip(0, 255).astype(np.uint8)
 
 
+def compute_blob_motion_lut(blob_vel_means: np.ndarray,
+                            ref_mag: Optional[float] = None,
+                            clip_pct: float = 95.0,
+                            subtract_median: bool = True,
+                            ) -> Tuple[np.ndarray, float]:
+    """Per-blob MOTION colour (Middlebury optical-flow-wheel convention): each
+    particle's average 3-D velocity ``blob_vel_means[i]`` -> a BGR colour whose
+    HUE encodes the in-image-plane motion DIRECTION and whose SATURATION encodes
+    the motion MAGNITUDE. Still particles read near-WHITE (S~0); differentially
+    moving particles read as a vivid direction-coloured hue — so the tile is a
+    motion segmentation: which bits of matter move, and which way.
+
+    ``blob_vel_means`` is ``(L, 3)`` (the per-blob velocity off
+    ``state.blobs_state.blob_vel_means``). Returns ``((L, 3) uint8 BGR LUT,
+    frame_ref)`` where ``frame_ref`` is THIS frame's ``clip_pct`` percentile of
+    (relative) speed.
+
+    ``subtract_median`` (default True) removes the robust median velocity of the
+    moving blobs first — EGO-MOTION COMPENSATION. Without it a panning camera
+    makes EVERY particle (background included) share one saturated hue (the whole
+    tile reads as a single colour); subtracting the dominant background velocity
+    sends the background to ~white and lets the object's RELATIVE motion pop. The
+    background is assumed to be the majority of moving blobs (true for DAVIS-style
+    single-object clips); set False for the raw absolute-velocity wheel.
+
+    ``ref_mag`` is the (relative) speed that maps to full saturation. Pass a value
+    (e.g. an EMA of ``frame_ref`` frozen after the first moving frame) so the
+    colours are STABLE / comparable across frames — a particle that speeds up gets
+    more saturated rather than the whole frame re-normalising. When None (or ~0)
+    the per-frame ``frame_ref`` is used (self-normalised), which is the right
+    behaviour on frame 0 / loop seams where flow is zero and everything is white.
+    """
+    v = np.asarray(blob_vel_means, dtype=np.float32)
+    if v.ndim != 2 or v.shape[1] < 2:
+        return np.full((v.shape[0], 3), 255, np.uint8), 0.0
+    L = v.shape[0]
+    active = np.linalg.norm(v, axis=1) > 1e-6
+    if subtract_median and int(active.sum()) >= 8:
+        v = v - np.median(v[active], axis=0)             # ego-motion compensation
+    mag = np.linalg.norm(v, axis=1)                       # relative 3-D speed
+    nz = mag[mag > 1e-6]
+    frame_ref = float(np.percentile(nz, clip_pct)) if nz.size else 0.0
+    scale = float(ref_mag) if (ref_mag is not None and ref_mag > 1e-9) else max(frame_ref, 1e-6)
+    ang = np.arctan2(v[:, 1], v[:, 0])                    # image-plane direction
+    hue = ((ang + np.pi) / (2.0 * np.pi) * 179.0).astype(np.float32)      # OpenCV H in [0,179]
+    sat = np.clip(mag / scale, 0.0, 1.0) * 255.0
+    hsv = np.stack([hue, sat, np.full(L, 255.0, np.float32)], axis=1
+                   ).clip(0, 255).astype(np.uint8)
+    bgr = cv2.cvtColor(hsv[None], cv2.COLOR_HSV2BGR)[0]
+    return bgr.astype(np.uint8), frame_ref
+
+
+def compute_blob_feature_lut(blob_features: np.ndarray,
+                             basis: Optional[dict] = None,
+                             ) -> Tuple[np.ndarray, dict]:
+    """Per-blob FEATURE colour: PCA-project each particle's mean DINO feature
+    ``blob_features[i]`` (``(L, D)`` off ``state.blobs_state.blob_features``) to a
+    BGR colour, so particles with similar APPEARANCE get similar colours — an
+    appearance/semantic colouring of the matter (does the cluster's particles
+    share a look?). Returns ``((L, 3) uint8 BGR LUT, basis)``.
+
+    ``basis`` FREEZES the PCA-to-RGB mapping (components + per-axis min/max) at
+    the first call, so colours stay STABLE across frames; a fresh per-frame PCA
+    would flip component signs / reorder axes and flicker. Pass the returned
+    basis back in on every later frame (mirrors the frozen pc_focal trick). Uses
+    the same project->minmax->255 recipe as ``viz.colors.features_to_rgb_pca``,
+    then flips RGB->BGR for the BGR render pipeline.
+    """
+    f = np.asarray(blob_features, dtype=np.float32)
+    if f.ndim != 2 or f.shape[0] < 3 or f.shape[1] < 3:
+        return np.full((f.shape[0], 3), 128, np.uint8), (basis or {"degenerate": True})
+    if basis is None or basis.get("degenerate"):
+        from sklearn.decomposition import PCA
+        n_comp = min(3, f.shape[1])
+        pca = PCA(n_components=n_comp, random_state=42)
+        proj = pca.fit_transform(f)
+        if n_comp < 3:
+            proj = np.concatenate([proj, np.zeros((proj.shape[0], 3 - n_comp), np.float32)], axis=1)
+        lo = proj.min(axis=0)
+        hi = proj.max(axis=0)
+        basis = {"pca": pca, "lo": lo, "hi": hi, "n_comp": n_comp}
+    else:
+        proj = basis["pca"].transform(f)
+        if basis["n_comp"] < 3:
+            proj = np.concatenate([proj, np.zeros((proj.shape[0], 3 - basis["n_comp"]), np.float32)], axis=1)
+        lo, hi = basis["lo"], basis["hi"]
+    span = np.maximum(hi - lo, 1e-8)
+    rgb = ((proj - lo) / span * 255.0).clip(0, 255).astype(np.uint8)     # (L, 3) RGB
+    return np.ascontiguousarray(rgb[:, ::-1]), basis                     # -> BGR
+
+
+def render_blob_gaussian_tile(blob_means: np.ndarray, blob_covs: np.ndarray,
+                              blob_assignments: np.ndarray, color_lut: np.ndarray,
+                              intr: Intrinsics = DEFAULT_INTRINSICS,
+                              h: int = 360, w: int = 640, *,
+                              base_bgr: Optional[np.ndarray] = None, dim: float = 0.32,
+                              ksigma: float = 2.5, thickness: int = 1,
+                              fill_alpha: float = 0.0, floor: float = 1.0,
+                              max_half: Optional[float] = None) -> np.ndarray:
+    """Render the tracker's ACTUAL particle Gaussians as 2-D image-plane ellipses,
+    colored by ``color_lut`` (per-blob average BGR, e.g. ``compute_blob_color_lut``).
+
+    FAITHFUL by construction: it draws the model's OWN latent ``blob_means`` (L,3)
+    and ``blob_covs`` (L,3,3) — NOT a per-frame re-fit of the datapoints — so the
+    visualization cannot drift away from what the tracker believes. Each occupied
+    blob (>=1 assigned datapoint) is projected with the ROBUST marginal in-plane
+    covariance at the mean depth:
+
+        u,v   = (f*X/Z + cx, f*Y/Z + cy)
+        Cov_px = (f/Z)^2 * blob_covs[:2,:2]            (+ floor*I)
+
+    Dropping the dU/dZ depth-coupling term of the full perspective Jacobian (which
+    ``covariance_to_ellipse_2d`` keeps) is what removes the brittleness — large
+    depth variance no longer blows the ellipse up. Ellipses are drawn largest-first
+    over a dimmed copy of ``base_bgr`` (so the scene shows faintly under the
+    particles), as crisp outlines (``thickness``) with an optional faint ``fill_alpha``.
+
+    Returns a (h, w, 3) uint8 BGR tile. Pure/additive — no tracker state is mutated
+    and ``render_matter_tile`` is untouched.
+    """
+    if max_half is None:
+        max_half = 0.33 * max(h, w)
+    if base_bgr is None:
+        canvas = np.full((h, w, 3), (18, 18, 26), np.uint8)
+    else:
+        bg = base_bgr if base_bgr.shape[:2] == (h, w) else cv2.resize(base_bgr, (w, h))
+        canvas = (bg.astype(np.float32) * dim).clip(0, 255).astype(np.uint8)
+    bm = np.asarray(blob_means, dtype=np.float64)
+    bc = np.asarray(blob_covs, dtype=np.float64)
+    lut = np.asarray(color_lut)
+    ba = np.asarray(blob_assignments)
+    f, cx, cy = float(intr.fx), float(intr.cx), float(intr.cy)
+    counts = np.bincount(ba[ba >= 0], minlength=bm.shape[0])
+    ell = []  # (area, center, axes, angle, color)
+    for b in np.where(counts > 0)[0]:
+        X, Y, Z = float(bm[b, 0]), float(bm[b, 1]), float(bm[b, 2])
+        if Z <= 1e-3:
+            continue
+        u, v = f * X / Z + cx, f * Y / Z + cy
+        cov2 = (f / Z) ** 2 * bc[b, :2, :2] + np.eye(2) * floor
+        evals, evecs = np.linalg.eigh(cov2)
+        evals = np.clip(evals, 1e-3, None)
+        maj = min(ksigma * float(np.sqrt(evals[1])), max_half)
+        mnr = min(ksigma * float(np.sqrt(evals[0])), max_half)
+        ang = float(np.degrees(np.arctan2(evecs[1, 1], evecs[0, 1])))
+        color = tuple(int(c) for c in lut[b]) if b < lut.shape[0] else (200, 200, 200)
+        ell.append((maj * mnr, (int(round(u)), int(round(v))),
+                    (max(1, int(maj)), max(1, int(mnr))), ang, color))
+    ell.sort(key=lambda e: -e[0])                     # largest first (small on top)
+    if fill_alpha > 0.0:
+        overlay = canvas.copy()
+        for _, ctr, axes, ang, color in ell:
+            cv2.ellipse(overlay, ctr, axes, ang, 0, 360, color, -1, cv2.LINE_AA)
+        canvas = cv2.addWeighted(overlay, fill_alpha, canvas, 1.0 - fill_alpha, 0.0)
+    for _, ctr, axes, ang, color in ell:
+        cv2.ellipse(canvas, ctr, axes, ang, 0, 360, color, thickness, cv2.LINE_AA)
+    return canvas
+
+
+def render_matter_label_grids(blob_assignments: np.ndarray,
+                              hyperblob_per_dp: np.ndarray,
+                              indices: np.ndarray,
+                              h: int = 360, w: int = 640,
+                              stride: int = STRIDE,
+                              rgb_guide: Optional[np.ndarray] = None,
+                              ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build the upsampled per-pixel LABEL grids that ``render_matter_tile``
+    colors, WITHOUT applying any palette/LUT — so a caller that needs the SAME
+    geometry under several colorings (e.g. the v2 grid: particles·feature AND
+    particles·motion AND clusters) pays the expensive NN-fill + edge-aware
+    upsample ONCE instead of once per coloring.
+
+    Returns ``(blob_full, hyper_full, outlier_full)``: two ``(h, w)`` int32 label
+    grids (blob ids clamped to ``[0, BLOB_PALETTE)``; hyperblob ids clamped to
+    ``[0, HYPERBLOB_PALETTE)``) and a ``(h, w)`` bool outlier mask. Colour them
+    with ``palette[grid]`` / ``lut[grid]`` then paint ``OUTLIER_BGR`` where
+    ``outlier_full`` — this reproduces ``render_matter_tile``'s output BIT-FOR-BIT
+    (see the equivalence assert in tests). This is a pure ADD; ``render_matter_
+    tile`` itself is unchanged (the live path is byte-identical).
+    """
+    gh, gw = h // stride, w // stride
+    n_blobs = BLOB_PALETTE.shape[0]
+    n_hypers = HYPERBLOB_PALETTE.shape[0]
+
+    is_outlier_dp = (blob_assignments < 0) | (hyperblob_per_dp < 0)
+    blob_safe = np.minimum(np.maximum(blob_assignments, 0), n_blobs - 1)
+    hyper_safe = np.minimum(np.maximum(hyperblob_per_dp, 0), n_hypers - 1)
+
+    UNFILLED = -1
+    blob_grid = np.full((gh * gw,), UNFILLED, dtype=np.int32)
+    hyper_grid = np.full((gh * gw,), UNFILLED, dtype=np.int32)
+    outlier_grid = np.zeros((gh * gw,), dtype=bool)
+
+    inlier_mask = ~is_outlier_dp
+    blob_grid[indices[inlier_mask]] = blob_safe[inlier_mask]
+    hyper_grid[indices[inlier_mask]] = hyper_safe[inlier_mask]
+    outlier_grid[indices[is_outlier_dp]] = True
+
+    blob_grid = _nn_fill_grid(blob_grid.reshape(gh, gw))
+    hyper_grid = _nn_fill_grid(hyper_grid.reshape(gh, gw))
+    outlier_grid = outlier_grid.reshape(gh, gw)
+
+    if rgb_guide is not None:
+        blob_full = _edge_aware_upsample(blob_grid.astype(np.int32), h, w, rgb_guide)
+        hyper_full = _edge_aware_upsample(hyper_grid.astype(np.int32), h, w, rgb_guide)
+    else:
+        blob_full = cv2.resize(blob_grid.astype(np.int32), (w, h), interpolation=cv2.INTER_NEAREST)
+        hyper_full = cv2.resize(hyper_grid.astype(np.int32), (w, h), interpolation=cv2.INTER_NEAREST)
+    outlier_full = cv2.resize(outlier_grid.astype(np.uint8), (w, h),
+                              interpolation=cv2.INTER_NEAREST).astype(bool)
+    return blob_full, hyper_full, outlier_full
+
+
 def render_matter_tile(blob_assignments: np.ndarray,
                         hyperblob_per_dp: np.ndarray,
                         indices: np.ndarray,
@@ -2048,6 +2261,8 @@ def _build_pointcloud_projection(
     point_subsample: int = 2,
     out_hw: Tuple[int, int] = (360, 960),
     focal_length: Optional[float] = None,
+    prev_centroid: Optional[np.ndarray] = None,
+    centroid_alpha: float = 1.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
     """Subsample, unproject, rotate, project, cull, depth-sort.  Returns
     ``(u, v, ys, xs, focal_length)`` — the int32 pixel coordinates in the
@@ -2061,6 +2276,16 @@ def _build_pointcloud_projection(
     when the underlying 3D geometry is stable, because the 98 th-percentile
     XY extents jitter with depth normalization noise.  Callers should compute
     autofit on the first frame, then thread the returned value back in.
+
+    ``prev_centroid`` / ``centroid_alpha`` FREEZE/SMOOTH the orbit center the
+    same way ``focal_length`` freezes the zoom.  The cloud is rotated around
+    ``centroid = pts.mean(0)`` recomputed every frame; that raw mean jitters
+    with depth-normalization noise, so the whole cloud (and any marbles sharing
+    this ``proj``) translates frame-to-frame.  Pass the previous frame's
+    ``proj['centroid']`` back in with a small ``centroid_alpha`` (e.g. 0.15) to
+    EMA it: ``centroid = alpha*raw + (1-alpha)*prev`` — high-freq swim removed,
+    slow object motion still tracked.  Default ``(None, 1.0)`` reproduces the
+    raw per-frame mean EXACTLY (bit-identical), so existing callers are unchanged.
 
     Empty input returns ``(empty, empty, empty, empty, 0.0)`` so the caller
     can splat onto a bg fill without a special-case path.
@@ -2101,7 +2326,13 @@ def _build_pointcloud_projection(
     # fixed look-at: the centroid always projects to the tile center, so a
     # yaw of 25° won't shift the cloud off the left edge of the tile the way
     # it did when we restored the full 3D centroid after rotation.
-    centroid = pts.mean(axis=0)
+    raw_centroid = pts.mean(axis=0)
+    if prev_centroid is None:
+        centroid = raw_centroid
+    else:
+        ca = float(centroid_alpha)
+        centroid = (ca * raw_centroid
+                    + (1.0 - ca) * np.asarray(prev_centroid, dtype=np.float32)).astype(np.float32)
     pts_c = pts - centroid
     yaw = np.deg2rad(yaw_deg)
     pitch = np.deg2rad(pitch_deg)
@@ -2291,9 +2522,100 @@ def render_pointcloud_tiles_pair(
         return blank.copy(), blank.copy(), f_used, proj
     colors_a = color_a_bgr[ys, xs].astype(np.uint8)
     colors_b = color_b_bgr[ys, xs].astype(np.uint8)
-    tile_a = _splat_pointcloud(u, v, colors_a, out_hw, point_size, bg_bgr)
-    tile_b = _splat_pointcloud(u, v, colors_b, out_hw, point_size, bg_bgr)
+    # Resolve the shared painter geometry once (winner point per pixel) and gather
+    # both colorings — bit-identical to two _splat_pointcloud calls, ~2x cheaper.
+    tile_a, tile_b = _splat_pointcloud_multi(u, v, [colors_a, colors_b],
+                                             out_hw, point_size, bg_bgr)
     return tile_a, tile_b, f_used, proj
+
+
+def _splat_pointcloud_multi(u: np.ndarray, v: np.ndarray,
+                            colors_list, out_hw: Tuple[int, int],
+                            point_size: int, bg_bgr: Tuple[int, int, int]):
+    """Splat SEVERAL color sources that share the SAME projected geometry.
+
+    The disk-offset broadcast (``v_off``/``u_off``) and the in-bounds ``mask`` are
+    a pure function of ``(u, v, point_size, out_hw)`` — identical for every tile —
+    so we compute them ONCE and only re-scatter the (different) colors per tile.
+    Bit-for-bit identical to calling ``_splat_pointcloud`` once per color source
+    (same offsets, same mask, same painter-interleaved write order)."""
+    out_H, out_W = out_hw
+    if u.size == 0:
+        return [np.full((out_H, out_W, 3), bg_bgr, dtype=np.uint8) for _ in colors_list]
+    offs_dy, offs_dx = _disk_offsets(point_size)
+    K = offs_dy.shape[0]
+    if K == 1 and int(offs_dy[0]) == 0 and int(offs_dx[0]) == 0:
+        imgs = []
+        for colors in colors_list:
+            img = np.full((out_H, out_W, 3), bg_bgr, dtype=np.uint8)
+            img[v, u] = colors
+            imgs.append(img)
+        return imgs
+    v_off = (v[:, None] + offs_dy[None, :]).reshape(-1)
+    u_off = (u[:, None] + offs_dx[None, :]).reshape(-1)
+    mask = (v_off >= 0) & (v_off < out_H) & (u_off >= 0) & (u_off < out_W)
+    vm = v_off[mask]
+    um = u_off[mask]
+    # Which source point each in-bounds disk pixel belongs to (row-major over the
+    # (N, K) point x offset broadcast == np.repeat(arange(N), K)).
+    pt_idx_m = np.repeat(np.arange(u.size, dtype=np.intp), K)[mask]
+    # Painter's algorithm with last-write-wins means each output pixel ends up
+    # showing the NEAREST point that covers it. That winner is a pure function of
+    # GEOMETRY (the disk scatter + far->near order), so it is IDENTICAL for every
+    # color source. Resolve it ONCE into a (H*W,) winner-point buffer (one big
+    # last-wins scatter, exactly the NumPy semantics the per-tile splat relied on),
+    # then each tile is a cheap gather over only the covered pixels instead of
+    # re-scattering all N*K disk writes. Bit-identical to splatting each tile.
+    lin = vm.astype(np.intp) * out_W + um
+    winner = np.full(out_H * out_W, -1, dtype=np.intp)
+    winner[lin] = pt_idx_m                      # last-wins == nearest == painter result
+    covered = winner >= 0
+    win_pts = winner[covered]
+    imgs = []
+    for colors in colors_list:
+        flat = np.empty((out_H * out_W, 3), dtype=np.uint8)
+        flat[:] = np.asarray(bg_bgr, dtype=np.uint8)
+        flat[covered] = colors[win_pts]
+        imgs.append(flat.reshape(out_H, out_W, 3))
+    return imgs
+
+
+def render_pointcloud_tiles_multi(
+    depth_hxw: np.ndarray,
+    color_sources,
+    intr: Intrinsics = DEFAULT_INTRINSICS,
+    yaw_deg: float = POINTCLOUD_YAW_DEG,
+    pitch_deg: float = POINTCLOUD_PITCH_DEG,
+    point_subsample: int = 2,
+    point_size: int = 2,
+    bg_bgr: Tuple[int, int, int] = (18, 18, 26),
+    out_hw: Tuple[int, int] = (360, 960),
+    focal_length: Optional[float] = None,
+    prev_centroid: Optional[np.ndarray] = None,
+    centroid_alpha: float = 1.0,
+):
+    """Render N point-cloud tiles that share geometry but differ only in color.
+
+    Builds the projection ONCE (unproject + rotate + cull + depth-sort) and the
+    splat geometry ONCE, then paints each ``color_sources[i]`` (an ``(H, W, 3)``
+    BGR tile sampled at the surviving source pixels). Output is bit-identical to
+    a ``render_pointcloud_tiles_pair`` + per-extra ``render_pointcloud_tile`` at
+    the SAME frozen ``focal_length``, but pays the projection + disk broadcast +
+    bounds mask once instead of once per tile.
+
+    Returns ``(tiles, focal_length, proj)`` where ``tiles`` is a list aligned to
+    ``color_sources``."""
+    out_H, out_W = out_hw
+    u, v, ys, xs, f_used, proj = _build_pointcloud_projection(
+        depth_hxw, intr, yaw_deg, pitch_deg, point_subsample, out_hw,
+        focal_length=focal_length, prev_centroid=prev_centroid,
+        centroid_alpha=centroid_alpha)
+    if u.size == 0:
+        blank = np.full((out_H, out_W, 3), bg_bgr, dtype=np.uint8)
+        return [blank.copy() for _ in color_sources], f_used, proj
+    colors_list = [np.asarray(c)[ys, xs].astype(np.uint8) for c in color_sources]
+    tiles = _splat_pointcloud_multi(u, v, colors_list, out_hw, point_size, bg_bgr)
+    return tiles, f_used, proj
 
 
 def render_particle_ellipsoid_tile(means_3d: np.ndarray, covs_3d: np.ndarray,
@@ -2350,6 +2672,206 @@ def render_particle_ellipsoid_tile(means_3d: np.ndarray, covs_3d: np.ndarray,
     m = (mask[..., None].astype(np.float32) / 255.0) * alpha
     out = canvas.astype(np.float32) * (1.0 - m) + overlay.astype(np.float32) * m
     return out.clip(0, 255).astype(np.uint8)
+
+
+# ---------------- Clean 3D particles: shaded "marbles" + multi-view + flicker-smoothing ----------------
+
+_LIT_SPHERE_CACHE: dict = {}
+
+
+def make_lit_sphere_sprite(size: int = 72,
+                           light_dir: Tuple[float, float, float] = (-0.45, -0.55, 1.0),
+                           ambient: float = 0.46, diffuse: float = 0.62,
+                           specular: float = 0.22, shininess: float = 22.0,
+                           edge: float = 0.16) -> np.ndarray:
+    """Precompute a unit lit-sphere SPRITE: an ``(size, size, 2)`` float32 image
+    whose channel 0 is per-pixel LUMINANCE (ambient + Lambert diffuse + a soft
+    specular highlight of a sphere lit from ``light_dir``) and channel 1 is a
+    smooth COVERAGE alpha (1 inside the disk, anti-aliased to 0 at the rim).
+
+    Warping this ONE sprite to each projected particle ellipse (``cv2.warpAffine``)
+    and compositing far->near yields SOLID shaded 3-D 'marbles' — no 2-D outline,
+    near marbles occlude far ones — for a fraction of a per-pixel raymarch cost.
+    Luminance peaks ~1.3 at the lit pole (a clipped specular glint) and falls to
+    ``ambient`` at the rim, so tinting by a particle's avg-RGB reads as a shaded
+    ball of that colour. Memoized by params."""
+    keyp = (size, light_dir, ambient, diffuse, specular, shininess, edge)
+    cached = _LIT_SPHERE_CACHE.get(keyp)
+    if cached is not None:
+        return cached
+    ax = (np.arange(size, dtype=np.float32) - (size - 1) * 0.5) / ((size - 1) * 0.5)
+    yy, xx = np.meshgrid(ax, ax, indexing="ij")            # image coords in [-1, 1]
+    rr = np.sqrt(xx * xx + yy * yy)
+    inside = rr <= 1.0
+    nz = np.sqrt(np.clip(1.0 - rr * rr, 0.0, 1.0))         # sphere height -> normal z
+    L = np.asarray(light_dir, dtype=np.float32)
+    L = L / (np.linalg.norm(L) + 1e-8)
+    ndotl = np.clip(xx * L[0] + yy * L[1] + nz * L[2], 0.0, 1.0)
+    spec = specular * np.power(ndotl, shininess)           # cheap glossy highlight
+    lum = (ambient + diffuse * ndotl + spec).astype(np.float32)
+    lum = np.where(inside, lum, 0.0)
+    cov = np.clip((1.0 - rr) / max(edge, 1e-3), 0.0, 1.0).astype(np.float32)
+    sprite = np.stack([lum, cov], axis=-1).astype(np.float32)
+    _LIT_SPHERE_CACHE[keyp] = sprite
+    return sprite
+
+
+def blob_alpha_from_weights(w_ema: np.ndarray, *, total_points: float = float(N_KEEP),
+                            min_points: float = 3.0,
+                            full_points: float = 11.0) -> np.ndarray:
+    """Map per-blob posterior-mean weights (already TEMPORALLY EMA-smoothed by the
+    caller) to a per-blob visibility ALPHA in ``[0, 1]`` via a smoothstep — so weak
+    particles FADE rather than pop (the flicker fix, read straight off the
+    probabilistic trace).
+
+    ``w_ema`` is the Dirichlet-multinomial posterior mean ``(beta + n_b)/sum``
+    (``extract_blob_weights``); ``w_ema * total_points`` is therefore the blob's
+    effective datapoint COUNT. A blob owning ``< min_points`` is invisible,
+    ``>= full_points`` fully opaque, with a smooth Hermite ramp between. Using a
+    STABLE ``total_points`` (not the per-frame inlier count) keeps the thresholds
+    from drifting frame-to-frame — a moving threshold would itself flicker."""
+    counts = np.asarray(w_ema, dtype=np.float32) * float(total_points)
+    denom = max(float(full_points) - float(min_points), 1e-6)
+    t = np.clip((counts - float(min_points)) / denom, 0.0, 1.0)
+    return (t * t * (3.0 - 2.0 * t)).astype(np.float32)    # smoothstep (C1, no kink)
+
+
+def render_particle_marbles_tile(means_3d: np.ndarray, covs_3d: np.ndarray,
+                                 colors_bgr: np.ndarray, proj: Optional[dict], *,
+                                 out_hw: Tuple[int, int] = (360, 960),
+                                 sigma_scale: float = 1.6,
+                                 alpha_per: Optional[np.ndarray] = None,
+                                 bg_bgr: Tuple[int, int, int] = (18, 18, 26),
+                                 base_tile: Optional[np.ndarray] = None,
+                                 base_dim: float = 0.40,
+                                 sprite: Optional[np.ndarray] = None,
+                                 max_half_frac: float = 0.22,
+                                 min_axis: float = 1.5) -> np.ndarray:
+    """Draw the tracker's particles as SOLID shaded 3-D ellipsoidal 'marbles' in
+    the SAME rotated view as a point-cloud tile (``proj`` from
+    ``render_pointcloud_tiles_multi`` / ``render_pointcloud_views``), so the
+    particles line up with the cloud.
+
+    For each particle we rotate its REAL ``means_3d`` / ``covs_3d`` into the view
+    frame (NO re-fit — exactly the cloud's R / centroid / focal — so the viz can't
+    diverge from tracking), project the mean and linearize the covariance to a 2-D
+    ellipse, ``warpAffine`` the precomputed lit-sphere ``sprite`` onto that
+    ellipse, tint by ``colors_bgr`` (avg-RGB per blob), and alpha-composite
+    far->near (painter occlusion: near marbles cover far — kills the 2-D-outline
+    spaghetti). ``alpha_per`` (per-blob, in ``[0, 1]``, from
+    ``blob_alpha_from_weights``) gates each marble so weak particles fade out
+    smoothly. Optionally drawn over ``base_tile`` (e.g. a dimmed point cloud) for
+    spatial context.
+
+    Returns an ``(out_H, out_W, 3)`` uint8 BGR tile. Purely additive; touches no
+    inference state."""
+    out_H, out_W = out_hw
+    if base_tile is not None:
+        canvas = (np.asarray(base_tile, np.float32) * float(base_dim)).clip(0, 255)
+        if canvas.shape[:2] != (out_H, out_W):
+            canvas = cv2.resize(canvas, (out_W, out_H))
+    else:
+        canvas = np.full((out_H, out_W, 3), bg_bgr, dtype=np.float32)
+    means = None if means_3d is None else np.asarray(means_3d, dtype=np.float32)
+    if proj is None or means is None or means.shape[0] == 0:
+        return canvas.clip(0, 255).astype(np.uint8)
+    f = float(proj["focal"])
+    if f <= 0.0:
+        return canvas.clip(0, 255).astype(np.uint8)
+    R = np.asarray(proj["R"], dtype=np.float32)
+    centroid = np.asarray(proj["centroid"], dtype=np.float32)
+    pc_intr = Intrinsics(fx=f, fy=f, cx=float(proj["out_cx"]), cy=float(proj["out_cy"]))
+    if sprite is None:
+        sprite = make_lit_sphere_sprite()
+    S = sprite.shape[0]
+    rs = (S - 1) * 0.5
+    n = means.shape[0]
+    if alpha_per is None:
+        alpha_per = np.ones(n, dtype=np.float32)
+    else:
+        alpha_per = np.asarray(alpha_per, dtype=np.float32)
+    colors_bgr = np.asarray(colors_bgr, dtype=np.float32)
+    m_rot = (means - centroid) @ R.T                       # match the cloud's rotation
+    m_rot[:, 2] += centroid[2]
+    uv = project_3d_to_2d(m_rot, pc_intr)
+    max_half = min(out_W, out_H) * float(max_half_frac)
+    for i in np.argsort(-m_rot[:, 2]):                     # painter: far -> near
+        a_vis = float(alpha_per[i])
+        if a_vis <= 0.02:                                  # culled (smoothly faded out)
+            continue
+        u, v = uv[i]
+        if not (np.isfinite(u) and np.isfinite(v)):
+            continue
+        cov_rot = R @ np.asarray(covs_3d[i], dtype=np.float64) @ R.T
+        (ha, hb), ang = covariance_to_ellipse_2d(cov_rot, m_rot[i], pc_intr,
+                                                 sigma_scale=sigma_scale, max_half=max_half)
+        ha = max(float(ha), min_axis)
+        hb = max(float(hb), min_axis)
+        th = np.deg2rad(ang)
+        cs_, sn_ = np.cos(th), np.sin(th)
+        # Forward affine mapping the sprite (centered, radius rs) onto the ellipse:
+        # sprite +x radius -> major axis (ha @ ang); sprite +y radius -> minor axis.
+        A = np.array([[ha * cs_ / rs, -hb * sn_ / rs],
+                      [ha * sn_ / rs,  hb * cs_ / rs]], dtype=np.float64)
+        rad = int(np.ceil(max(ha, hb))) + 2
+        cu, cv_ = int(round(float(u))), int(round(float(v)))
+        x0 = max(cu - rad, 0); x1 = min(cu + rad + 1, out_W)
+        y0 = max(cv_ - rad, 0); y1 = min(cv_ + rad + 1, out_H)
+        if x1 <= x0 or y1 <= y0:                           # entirely off-tile
+            continue
+        t = np.array([float(u), float(v)], dtype=np.float64) - A @ np.array([rs, rs])
+        M = np.array([[A[0, 0], A[0, 1], t[0] - x0],
+                      [A[1, 0], A[1, 1], t[1] - y0]], dtype=np.float64)
+        warped = cv2.warpAffine(sprite, M, (x1 - x0, y1 - y0),
+                                flags=cv2.INTER_LINEAR, borderValue=0.0)
+        lum = warped[..., 0]
+        cov = warped[..., 1]
+        a_eff = (cov * a_vis)[..., None]
+        col = colors_bgr[i][None, None, :] * lum[..., None]
+        reg = canvas[y0:y1, x0:x1]
+        canvas[y0:y1, x0:x1] = reg * (1.0 - a_eff) + col * a_eff
+    return canvas.clip(0, 255).astype(np.uint8)
+
+
+def render_pointcloud_views(
+    depth_hxw: np.ndarray,
+    color_sources,
+    intr: Intrinsics = DEFAULT_INTRINSICS,
+    yaws: Tuple[float, ...] = (-18.0, 0.0, 18.0),
+    pitch_deg: float = POINTCLOUD_PITCH_DEG,
+    point_subsample: int = 2,
+    point_size: int = 2,
+    bg_bgr: Tuple[int, int, int] = (18, 18, 26),
+    out_hw: Tuple[int, int] = (360, 960),
+    focal_lengths=None,
+):
+    """Render the SAME point cloud from several yaw angles (multi-view); each yaw
+    shares one projection + winner-buffer splat across all ``color_sources``.
+
+    A single-camera depth map only captures the visible surface, so rotating the
+    cloud reveals empty space behind the foreground (the 'shadow swan' hole).
+    Flanking a hole-free near-frontal ``0deg`` view with symmetric ``+/-`` yaws
+    makes that gap read as an honest rotation artifact rather than a ghost
+    duplicate.
+
+    Returns ``(views, focal_lengths, projs)`` where ``views[k]`` is the list of
+    per-colour tiles at ``yaws[k]``, ``focal_lengths[k]`` the frozen focal for that
+    yaw (thread it back in next frame to stabilize framing), and ``projs[k]`` the
+    projection dict for that yaw (pass to ``render_particle_marbles_tile`` to align
+    marbles with that exact view). Purely additive."""
+    yaws = list(yaws)
+    if focal_lengths is None:
+        focal_lengths = [None] * len(yaws)
+    views, out_focals, projs = [], [], []
+    for k, yaw in enumerate(yaws):
+        tiles, f_used, proj = render_pointcloud_tiles_multi(
+            depth_hxw, color_sources, intr, yaw_deg=float(yaw), pitch_deg=pitch_deg,
+            point_subsample=point_subsample, point_size=point_size, bg_bgr=bg_bgr,
+            out_hw=out_hw, focal_length=focal_lengths[k])
+        views.append(tiles)
+        out_focals.append(focal_lengths[k] if focal_lengths[k] is not None else f_used)
+        projs.append(proj)
+    return views, out_focals, projs
 
 
 # ---------------- Self-test ----------------

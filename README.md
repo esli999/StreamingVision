@@ -77,6 +77,21 @@ jupyter nbconvert --to notebook --execute streaming_demo.ipynb \
                   --ExecutePreprocessor.timeout=300
 ```
 
+## Rendering the particle demo
+
+The 2×3 particle visualization (the GenMatter tracker's latent Gaussians rendered in
+2-D and 3-D, under a slow camera pan) is one command:
+
+```bash
+scripts/render_particles_demo.sh                    # the 5 focus videos
+scripts/render_particles_demo.sh --videos blackswan # any DAVIS or custom video by name
+```
+
+Outputs land in `runs/calibrate_consistency/viz_gaussian/`. See
+[`docs/RENDER_PARTICLES.md`](docs/RENDER_PARTICLES.md) for the tile layout, the tuning
+knobs, how to add a new video, and the design log. `scripts/diagnose_background_bleed.py`
+is a read-only tracking diagnostic.
+
 ## Architecture
 
 9 threads: 1 frame source, 5 workers (depth, flow, features, fusion, and
