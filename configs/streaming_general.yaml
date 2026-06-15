@@ -1,0 +1,168 @@
+# StreamingVision: self-supervised, structure-aware calibrated hypers.
+# ONE GLOBAL config; NO per-video knobs; NO test-set tuning.
+#
+# Methodology: hypers LEARNED + the global scalar tuple SELECTED entirely
+# self-supervised on a TRAIN split (region-J of the CLUSTER foreground vs
+# cached SAM Z_sam>0). Real DAVIS GT was read ONCE, on a disjoint HELD-OUT
+# split, as the generalization gate only. Two-level approximate inference:
+# per-frame Bayesian filtering with 1 Gibbs sweeps + a 1-sweep
+# warmup (the deep E-step that de-biases the conjugate M-step), outer
+# SAEM (α=0.3 damping, numerical-stability veto, per-group accept-test on
+# an 8-video crossval subset OF TRAIN: cluster / particle / motion).
+#
+# Inference strategy (ONE global config — these ship alongside the hypers):
+#   use_sam_frame0    = True  (SAM2 frame-0 semantic init)
+#   num_blobs         = 128
+#   num_hyperblobs    = 4  (k-means fallback; SAM init sets it dynamically)
+#   init_gibbs_sweeps = 1
+#   per-frame sweeps  = 1  (calibration depth; live demo runs 1)
+# Chosen scalar values:
+#   sigma_F      = 0.3857
+#   sigma_F_H    = 1.0507
+#   sigma_V      = 3.972e-02  (streaming_default.yaml keeps 1e14 -> live path bit-exact)
+#   outlier_prob = 5.000
+#   gamma_shape  = 5.000
+#   gamma_rate   = 1.000
+#   alpha        = 2.926
+#   beta         = 1.086
+#   sigma_H      = 25.000
+#   nu_B / nu_H / nu_V = 49.7 / 8.7 / 37.6
+#   translation_max_radius     = 0.8692
+#   translation_gaussian_scale = 0.0788
+#   use_calibrated_priors      = True
+#   feature_update_damping     = 0.0000  (anti-drift; 0 = freeze frame-0 appearance)
+paths:
+  custom_videos_root: assets/custom_videos
+  deeplearning_weights_dir: assets/deeplearning_weights
+  video_depth_anything_path: null
+preprocess:
+  pipeline:
+    skip_existing: true
+    force: false
+  frames:
+    max_len: -1
+    target_fps: -1
+    skip_frames: 1
+    max_res: 1280
+    jpg_quality: 95
+    frame_name_pattern: '{:05d}.jpg'
+  motion_3d:
+    encoder: vits
+    input_size: 392
+    max_res: 480
+    max_len: -1
+    target_fps: -1
+    fp32: false
+    device: cuda
+    skip_frames: 1
+    subsample: 1.0
+  dino:
+    target_h: 520
+    target_w: 960
+    patch_size: 14
+    n_components: 10
+    device: cuda
+  sam_frame0:
+    model: sam2.1_l.pt
+    min_threshold: 0.15
+    seed: 42
+    frame_name: 00000.jpg
+pseudo_gt:
+  model: sam2.1_l.pt
+  min_threshold: 0.15
+  iou_threshold: 0.3
+  prefer_video: true
+  video_imgsz: 1024
+  max_objects: 12
+  video_chunk_frames: 16
+  detect_new_objects: true
+tracking:
+  pipeline:
+    skip_existing: false
+    force: false
+  measure_fps: true
+  num_blobs: 128
+  num_hyperblobs: 4
+  datapoint_retain_pct: 81.25
+  random_seed: 42
+  focal_length: 520.0
+  use_sam_frame0: true
+  init_gibbs_sweeps: 1
+  tracking_outlier_prob: 1.0e-28
+  dense_disable_outlier_prob: false
+  calibrate_feature_sigmas: false
+  blob_counting_threshold: 0
+  hyperparams:
+    sigma_F: 0.38569269121330507
+    sigma_F_H: 1.050705145320235
+    outlier_prob: 5.0
+    outlier_velocity_gamma_shape: 5.0
+    outlier_velocity_gamma_rate: 1.0
+    alpha: 2.9259403008574223
+    beta: 1.085995904361067
+    sigma_H: 25.0
+    sigma_V: 0.03971709489426276
+    translation_gaussian_scale: 0.0787786604830995
+    translation_max_radius: 0.8692489324355112
+    translation_num_radii_cells: 15
+    translation_theta_step_deg: 15
+    rotation_vmf_kappa: 100.0
+    rotation_angle_max_deg: 25.0
+    rotation_angle_step_deg: 0.375
+    Psi_B:
+    - - 0.28162696957588196
+      - -0.00010107715934282169
+      - -0.005173679441213608
+    - - -0.0001010772175504826
+      - 0.04695134609937668
+      - -0.04017334803938866
+    - - -0.005173681303858757
+      - -0.04017334803938866
+      - 0.11926981806755066
+    Psi_H:
+    - - 0.7877780795097351
+      - 0.011945286765694618
+      - -0.029508601874113083
+    - - 0.011945286765694618
+      - 0.4850018322467804
+      - -0.079826720058918
+    - - -0.029508601874113083
+      - -0.079826720058918
+      - 0.559911847114563
+    Psi_V:
+    - - 0.0024063726887106895
+      - 0.00010896912135649472
+      - 0.00019669928587973118
+    - - 0.00010896912135649472
+      - 0.0014093972276896238
+      - -0.0007672121282666922
+    - - 0.00019669925677590072
+      - -0.0007672121282666922
+      - 0.013462034985423088
+    nu_B: 49.745999999999995
+    nu_H: 8.70625
+    nu_V: 37.59149999999999
+    mu_H:
+    - 0.07244148850440979
+    - -0.088508740067482
+    - 2.4951353073120117
+  feature_aware_final_assignment: true
+  final_assignment_outlier: false
+  freeze_hyperblob_assignment: true
+  pure_object_seed: true
+  blob_means_updates_per_frame: 1
+  freeze_blob_features: false
+  feature_update_damping: 0.0
+  use_calibrated_priors: true
+viz:
+  pipeline:
+    skip_existing: false
+    force: false
+  point_radius: 0.015
+  flow_arrow_scale: 1.0
+  ellipsoid_sigma_scale: 1.0
+  feature_pca_seed: 42
+  include_assignment_colors: true
+  include_hyperblob_assignment_colors: true
+  include_flow: true
+  include_depth: true
