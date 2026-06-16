@@ -7,6 +7,9 @@ cloud of 3-D Gaussian "particles" stuck to the scene. The visualization draws th
 tracker's **actual** latent state — the real blob means/covariances and cluster
 assignments — so it never diverges from what the model believes.
 
+> The real-time version of **[GenMatter](https://github.com/esli999/GenMatter)** — bringing its
+> motion tracking and segmentation to live video.
+
 ![the GenMatter tracker on DAVIS / dog](docs/media/hero_dog.gif)
 ![the GenMatter tracker on DAVIS / blackswan](docs/media/hero_blackswan.gif)
 
