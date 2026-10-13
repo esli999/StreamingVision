@@ -13,7 +13,10 @@ matplotlib
 genjax==0.10.3
 tensorflow-probability==0.23.0
 scikit-learn
+scipy
+safetensors
 scikit-image==0.25.2
+numba>=0.60,<0.66  # CPU triangle rasterizer; no graphics driver required
 # SAM2 (ultralytics) for the TokenCut frame-0 seed augmentation
 ultralytics>=8.4.26
 # Vendored CLI machinery

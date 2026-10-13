@@ -20,8 +20,8 @@ Calibration to 640x360 test.mp4
     ``configs/streaming_default.yaml`` (or ``streaming_general.yaml`` once
     the multi-video calibrator has produced it).  ``sigma_F`` defaults to
     2.0; lower values produced an outlier-dominated visualization.
-  * Depth model returns relative inverse depth; we min/max-normalize per
-    frame and invert to a pseudo-Z in roughly [0.83, 5.0] m.
+  * Depth model returns relative inverse depth; normalization and inversion
+    produce dimensionless pseudo-Z in roughly [1, 5], not metric distance.
   * DINO PCA: fit a 384 -> 32 basis on the first frame's per-pixel features
     and freeze it; per-dim z-score so the model's sigma_F is appropriately
     scaled (matches DAVIS's pre-normalized `gaussian_means/_stds`).
@@ -36,6 +36,17 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 import numpy as np
+
+# GenJAX / TensorFlow Probability's seed folding relies on NumPy 1.x integer
+# conversion. Fail before starting workers: otherwise NumPy 2.x raises inside
+# MatterWorker and the live demo can still write an MP4 containing only errors.
+if np.lib.NumpyVersion(np.__version__) >= "2.0.0":
+    raise RuntimeError(
+        f"StreamingVision requires numpy<2 (found {np.__version__}) for "
+        "GenJAX / TensorFlow Probability. In the demo environment, run "
+        "python -m pip install 'numpy<2' (see requirements.txt)."
+    )
+
 import cv2
 import yaml
 
@@ -604,7 +615,8 @@ def init_state(positions: np.ndarray, velocities: np.ndarray, features: np.ndarr
                 num_warmup_sweeps: Optional[int] = None, verbose: bool = False,
                 sam_segmentation: Optional[np.ndarray] = None,
                 subsample_indices: Optional[np.ndarray] = None,
-                debug_capture: Optional[dict] = None):
+                debug_capture: Optional[dict] = None,
+                seed_choice_map=None):
     """Bootstrap the GenMatter_State_DINO on the first valid (depth, flow,
     features) tuple.  Runs K-means + ``num_warmup_sweeps`` Gibbs iterations
     (the slow startup, dominated by JIT compile of the Gibbs sweep).
@@ -639,7 +651,9 @@ def init_state(positions: np.ndarray, velocities: np.ndarray, features: np.ndarr
 
     use_sam = (bool(tracking_cfg.get("use_sam_frame0", False))
                and sam_segmentation is not None and subsample_indices is not None)
-    if use_sam:
+    if seed_choice_map is not None:
+        kmeans_chm = seed_choice_map
+    elif use_sam:
         sam_h, sam_w = sam_segmentation.shape[:2]
         _log(f"entering SAM-frame-0 hierarchical init ({sam_h}x{sam_w} mask)")
         kmeans_chm, _roi_b, _roi_h, num_hyperblobs = make_hierarchical_kmeans_chm_with_SAM_segmentations(
@@ -726,8 +740,9 @@ def init_state(positions: np.ndarray, velocities: np.ndarray, features: np.ndarr
 
     _log(f"running init_gibbs_sweep_dino (num_sweeps={num_warmup_sweeps})")
     key, k_warm = jax.random.split(key)
-    gibbs_wtrs = init_gibbs_sweep_dino(k_warm, state, num_sweeps=num_warmup_sweeps)
-    state = gibbs_wtrs[-1].retval
+    if num_warmup_sweeps > 0:
+        gibbs_wtrs = init_gibbs_sweep_dino(k_warm, state, num_sweeps=num_warmup_sweeps)
+        state = gibbs_wtrs[-1].retval
     state.datapoints_state.blob_assignments.block_until_ready()
     _log("init_gibbs_sweep_dino done")
 
@@ -866,10 +881,13 @@ def _robust_blob_means(key, st, *, robust_delta):
     sigmaV = st.hypers.sigma_V
     blob_cov_inv = jnp.linalg.inv(blob_covs)                     # [L,3,3]
 
-    # Huber weighting is disabled here (shrinking N inflates the sample noise); this
-    # function instead supplies the in-tracker temporal MEAN PRIOR, with robust_delta
-    # used as the prior strength.  w = 1 reproduces the vendored equal-weight sums.
-    w = jnp.ones(x.shape[0], dtype=x.dtype)
+    # Bound the influence of unexpected geometry (occlusion / depth spikes).
+    # Outlier assignments never contribute to a blob's sufficient statistics.
+    safe_a = jnp.clip(a, 0, L-1)
+    residual = x - blob_means[safe_a]
+    distance = jnp.sqrt(jnp.maximum(jnp.einsum(
+        'ni,nij,nj->n', residual, blob_cov_inv[safe_a], residual), 0.) + 1e-8)
+    w = jnp.minimum(1., robust_delta / distance) * ((a >= 0) & (a < L))
     one_hot = jax.nn.one_hot(a, L, dtype=x.dtype)              # [N,L] (outliers a<0 -> all-zero row)
     N_l = jnp.einsum('n,nl->l', w, one_hot)                    # [L]
     S_l = jnp.einsum('ni,nl->li', x * w[:, None], one_hot)     # [L,3]
@@ -893,7 +911,8 @@ def _robust_blob_means(key, st, *, robust_delta):
     # it to blob_vel_means+prev before the sweeps).  Prior precision = strength x the DATA
     # precision (scale-free): strength=1 weights the prediction equal to all this frame's
     # datapoints.  A STATIC blob HOLDS vs depth jitter; a MOVING blob is anchored to its
-    # advanced prediction, so it still tracks.  (strength = robust_delta.)
+    # advanced prediction, so it still tracks. The Huber knee is independent of
+    # this weak temporal prior (one quarter of the observed data precision).
     data_prec = blob_cov_inv * N_l[:, None, None]              # [L,3,3]
     # MOTION-ADAPTIVE gate: only a STATIC blob (small blob_vel_means) gets the hold-prior;
     # a MOVING blob (a moving object, or a moving-CAMERA background) has large velocity ->
@@ -901,13 +920,28 @@ def _robust_blob_means(key, st, *, robust_delta):
     # WITHOUT damping any foreground motion or a moving-camera background.
     vmag = jnp.linalg.norm(bs.blob_vel_means, axis=-1)         # [L]
     gate = 1.0 / (1.0 + (vmag / 0.03) ** 2)                    # [L] ~1 slow, ~0 fast
-    sv = (robust_delta * gate)[:, None]                        # [L,1]
+    sv = (0.25 * gate)[:, None]                               # [L,1]
     P_post = P_post + sv[:, :, None] * data_prec               # [L,3,3]
     weighted_mean = weighted_mean + sv * jnp.einsum('lij,lj->li', data_prec, blob_means)
     cov_post = jnp.linalg.inv(P_post)                           # [L,3,3]
     mean_post = jnp.einsum('lij,lj->li', cov_post, weighted_mean)
     new_blob_means = jax.random.multivariate_normal(posterior_key, mean_post, cov_post)
     return st.replace({'blobs_state': {'blob_means': new_blob_means}})
+
+
+def _last_independent_update(key, state, update, count):
+    """Keep the final draw of repeated identical conditionals and its exact key.
+
+    Valid only if an update does not depend on its previous output. Velocity
+    means have this property; velocity covariance draws do too (unsupported
+    blobs retain their input covariance). Feature draws use a fixed prior and,
+    when enabled, a fixed anchor. Do NOT apply to coupled hyperblob updates or
+    the iteratively reweighted robust mean update.
+    """
+    if count == 0:
+        return key, state
+    key = jax.lax.fori_loop(0, count-1, lambda _, k: jax.random.split(k)[0], key)
+    return update(count-1, (key, state))
 
 
 def blob_tracking_gibbs_dino_streaming(key, genmatter_state, *,
@@ -1185,11 +1219,11 @@ def blob_tracking_gibbs_dino_streaming(key, genmatter_state, *,
     # The DAMPED path always runs the 3 updates (the blend toward the anchor,
     # inside update_blob_features_dino, applies the damping continuously).
     _feat_updates = 3 if (_blend or not freeze_blob_features) else 0
-    key, genmatter_state = jax.lax.fori_loop(0, _feat_updates, update_blob_features_dino, (key, genmatter_state))
+    key, genmatter_state = _last_independent_update(key, genmatter_state, update_blob_features_dino, _feat_updates)
     key, genmatter_state = jax.lax.fori_loop(0, 1, final_step, (key, genmatter_state))
-    key, genmatter_state = jax.lax.fori_loop(0, 15, update_blob_velocities, (key, genmatter_state))
-    key, genmatter_state = jax.lax.fori_loop(0, 15, update_blob_velocity_covariances, (key, genmatter_state))
-    key, genmatter_state = jax.lax.fori_loop(0, _feat_updates, update_blob_features_dino, (key, genmatter_state))
+    key, genmatter_state = _last_independent_update(key, genmatter_state, update_blob_velocities, 15)
+    key, genmatter_state = _last_independent_update(key, genmatter_state, update_blob_velocity_covariances, 15)
+    key, genmatter_state = _last_independent_update(key, genmatter_state, update_blob_features_dino, _feat_updates)
     key, genmatter_state = jax.lax.fori_loop(0, 3, hyperblob_update_loop, (key, genmatter_state))
 
     return genmatter_state

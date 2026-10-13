@@ -33,25 +33,25 @@ _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
-def load_dino(device: str = "cuda", dtype=torch.float16):
-    """Load DINOv2-S in eval mode on ``device`` (no AutoImageProcessor — we
+def load_dino(device: str = "cuda", dtype=torch.float16, checkpoint: str = DINO_CKPT):
+    """Load a DINOv2 checkpoint in eval mode on ``device`` (no AutoImageProcessor — we
     normalize manually so we can pick the patch resolution)."""
     from transformers import AutoModel
 
-    return AutoModel.from_pretrained(DINO_CKPT, torch_dtype=dtype).to(device).eval()
+    return AutoModel.from_pretrained(checkpoint, torch_dtype=dtype).to(device).eval()
 
 
 def dino_patches(model, rgb: np.ndarray, device: str = "cuda",
                  dino_h: int = DINO_H, dino_w: int = DINO_W,
                  ) -> Tuple[np.ndarray, Tuple[int, int]]:
-    """Dense DINOv2-S patch features for one RGB frame.
+    """Dense DINOv2 patch features for one RGB frame, excluding CLS/registers.
 
     rgb : (H, W, 3) uint8 RGB.  Resized to ``(dino_h, dino_w)``, ImageNet-
           normalized, run through DINOv2-S with ``interpolate_pos_encoding`` so
           the patch grid is ``(dino_h // 14, dino_w // 14)`` rather than the
           processor's 16x16 224 crop.
 
-    Returns ``(patches (gh*gw, 384) float32, (gh, gw))``.
+    Returns ``(patches (gh*gw, model_width) float32, (gh, gw))``.
     """
     mean = torch.tensor(_IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
     std = torch.tensor(_IMAGENET_STD, device=device).view(1, 3, 1, 1)
@@ -62,6 +62,10 @@ def dino_patches(model, rgb: np.ndarray, device: str = "cuda",
         x = x.permute(2, 0, 1)[None].float() / 255.0
         x = ((x - mean) / std).to(dtype=model_dtype)
         out = model(pixel_values=x, interpolate_pos_encoding=True).last_hidden_state[0]
-        patches = out[1:].float().cpu().numpy()
+        # Register models insert extra non-spatial tokens after CLS.
+        start = 1 + int(getattr(model.config, "num_register_tokens", 0))
+        patches = out[start:].float().cpu().numpy()
     gh, gw = dino_h // DINO_PATCH, dino_w // DINO_PATCH
+    if len(patches) != gh * gw:
+        raise ValueError(f"Expected {gh*gw} patch tokens; got {len(patches)}")
     return patches, (gh, gw)

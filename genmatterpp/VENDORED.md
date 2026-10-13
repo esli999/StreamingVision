@@ -8,13 +8,13 @@ This directory is a one-shot `git archive` of GenMatter++ at the commit:
   ("Realtime demo: custom CLI, JIT tracking, bayesopt, DAVIS integration")
 - **Vendored on**: 2026-05-20
 
-The intent is **self-contained shipping**: StreamingVision no longer depends on the sibling repo at `/home/esli/GenMatterPlusPlus`.
+The intent is **self-contained shipping**: StreamingVision no longer depends on a sibling GenMatter++ checkout.
 
 ## How it was vendored
 
 ```
 mkdir -p StreamingVision/genmatterpp
-git -C /home/esli/GenMatterPlusPlus archive origin/arijit/realtime-demo \
+git -C /path/to/GenMatterPlusPlus archive origin/arijit/realtime-demo \
     | tar -x -C StreamingVision/genmatterpp
 # clean up
 rm -f genmatterpp/uv.lock

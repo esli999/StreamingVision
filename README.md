@@ -1,22 +1,22 @@
 # StreamingVision
 
 **Real-time Gaussian-particle tracking from a streaming video.** Each frame is
-turned into metric depth (Depth-Anything V2), optical flow (SEA-RAFT), and DINOv2
+turned into relative depth (Depth-Anything V2), optical flow (SEA-RAFT), and DINOv2
 features, which drive a **GenMatter++ Gibbs tracker** that maintains a persistent
 cloud of 3-D Gaussian "particles" stuck to the scene. The visualization draws the
-tracker's **actual** latent state — the real blob means/covariances and cluster
-assignments — so it never diverges from what the model believes.
+tracker's latent state — blob means/covariances and cluster assignments.
+The detailed offline figure uses flow-guided display stabilization; raw captures
+remain available through `--raw-particles` and the dedicated stability comparison script.
 
 > The real-time version of **[GenMatter](https://github.com/esli999/GenMatter)** — bringing its
-> motion tracking and segmentation to live video.
+> motion tracking and segmentation to live video. [Original paper](https://arxiv.org/abs/2604.22160).
 
 ![the GenMatter tracker on DAVIS / dog](docs/media/hero_dog.gif)
 ![the GenMatter tracker on DAVIS / blackswan](docs/media/hero_blackswan.gif)
 
-*The unified pipeline figure: **RGB input → 3-D Gaussian particles** (shown from the
-real input camera plus two novel views) **→ RGB reconstruction + object segmentation**,
-with live per-stage inference timing. Every particle is a Gaussian the tracker is
-actually maintaining.*
+*Offline figures place the input beside the 3D particle scene, with inferred
+segmentation and 2.5D surfaces below and particle-model renderings at the
+initial camera and two reposed cameras. The GIFs above are the earlier live-demo assets.*
 
 ## Quickstart
 
@@ -25,29 +25,59 @@ One-time: create the env and clone the optical-flow code (details in
 run also pays a ~30–90 s JIT + K-means warm-up.
 
 ```bash
-# 1. Render the particle figure on the bundled sample video (no dataset needed):
-RENDER_MODE=focused DEMO_NUM_BLOBS=256 \
-  scripts/render_particles_demo.sh --source assets/test.mp4 --target-duration 0
-#    -> runs/calibrate_consistency/viz_gaussian/test_unified.mp4
+# 1. Render the sample with its local frame-0 mask (or supply --seed-mask):
+python scripts/render_unified.py --videos test --preset quality
+#    -> runs/unified_quality/output/test_unified.mp4
 
 # 2. Run the live, multi-threaded streaming demo (real-time perception overlay):
-python render_demo.py --source assets/test.mp4 --duration 10
-#    -> assets/streaming_demo.mp4
+python render_demo.py --source assets/test.mp4 --duration 10 --out runs/streaming_demo.mp4
 
 # 3. The featured figures on DAVIS (after fetching the dataset, see Setup):
-RENDER_MODE=focused scripts/render_particles_demo.sh --videos dog blackswan
+python scripts/render_unified.py --videos dog blackswan --out-dir runs/davis_figures
 ```
 
-`--source` accepts any mp4/mov or RGB-frames directory and seeds frame 0 with
-k-means (no ground-truth or SAM masks required). `--videos` renders named DAVIS /
-custom clips; the sentinels `all-davis` / `all-custom` / `all` enumerate every test
-video from disk. See [`docs/RENDER_PARTICLES.md`](docs/RENDER_PARTICLES.md) for the
-figure layout, every CLI flag, and the render-only tuning knobs.
+`--source` accepts an MP4/MOV or image directory with `--seed-mask`; optionally
+choose object instances using `--foreground-ids`. `--videos` resolves named DAVIS
+or custom clips and their initial masks. `--stage render` reuses the saved state
+without loading inference models; `--stage benchmark` measures inference alone.
+Presets live in `configs/unified.yaml`. See
+[legacy particle rendering](docs/RENDER_PARTICLES.md) for the older 2×3 layout.
+
+## Validate the demos without replacing assets
+
+Run these commands from the repository root in the `streamingvision` environment.
+Keep `numpy<2` as specified in `requirements.txt`: NumPy 2.x breaks GenJAX / TensorFlow
+Probability seed initialization. If an existing environment has drifted, restore it
+with `python -m pip install 'numpy<2'` in a dedicated demo environment.
+
+```bash
+python -m pytest tests -q
+
+# Use a fresh temporary directory for all validation outputs.
+DEMO_CHECK_DIR=$(mktemp -d /tmp/streamingvision-check.XXXXXX)
+python render_demo.py --source assets/test.mp4 --duration 10 \
+  --out "$DEMO_CHECK_DIR/streaming_demo.mp4"
+python scripts/render_unified.py --videos test --preset fast \
+  --max-frames 24 --target-duration 0 --out-dir "$DEMO_CHECK_DIR"
+
+# Decode both files fully; a successful process alone does not validate the MP4.
+ffmpeg -v error -xerror -i "$DEMO_CHECK_DIR/streaming_demo.mp4" -f null -
+ffmpeg -v error -xerror -i "$DEMO_CHECK_DIR/test_unified.mp4" -f null -
+```
+
+Also check the logs for worker exceptions and nonzero tracker activity, and inspect
+frames for populated perception, particle, reconstruction, and segmentation panels.
+The particle CLI exits nonzero if any requested render fails.
+
+The demo source, launcher, configs, vendored tracking core, bundled `assets/test.mp4`,
+and README GIFs are tracked. Generated MP4s, datasets, model weights, caches, and
+`third_party/` checkouts are intentionally ignored; install SEA-RAFT as described
+in [Setup](#setup). Validation output does not need to be committed.
 
 ## How it works
 
 ```
-                 ┌─► Depth-Anything V2 ─► metric depth ──┐
+                 ┌─► Depth-Anything V2 ─► relative depth ┐
    video frame ──┼─► SEA-RAFT ──────────► optical flow ──┼─► unproject ─► 3-D points
                  └─► DINOv2-S ──────────► dense features ─┘   (+ velocities, features)
                                                                       │
@@ -56,16 +86,19 @@ figure layout, every CLI flag, and the render-only tuning knobs.
                                           GenMatter++ Gibbs tracker (genmatter_rt)
 ```
 
-One Gibbs sweep runs per incoming frame, so blob/hyperblob (particle/cluster) state
-persists and tracks across the clip. The tracker and renderer are cleanly separated —
-tuning or swapping the visualization can never change tracking results.
+Particle state persists across frames. The unified pipeline combines configurable
+GenMatter Gibbs sweeps with object-conditioned posterior assignment and robust
+geometry updates. Tracking and offline rendering are separate, so rendering a
+capture again cannot change its inference results.
 
 | File | Role |
 |------|------|
 | `genmatter_rt.py` | the streaming **tracker** — perception → `init_state` / `step_multi_sweep` → particle state |
 | `genmatter_viz.py` | the **renderer** — draws the tracker's real Gaussians; one-directional dep on the tracker |
 | `render_demo.py` | the **live demo** — multi-threaded real-time pipeline → annotated MP4 |
-| `scripts/render_gaussian_demo.py` | the **particle figure** renderer (the hero output above) |
+| `scripts/render_gaussian_demo.py` | legacy particle figures and focused-mode compatibility entry point |
+| `unified/` / `scripts/render_unified.py` | causal inference captures, object identity, offline figure rendering and timing |
+| `scripts/evaluate_unified.py` | training-only selection and held-out DAVIS/custom evaluation |
 | `scripts/tokencut.py` | self-supervised TokenCut frame-0 seed augmentation (offline) |
 | `genmatterpp/` | vendored GenMatter++ JAX inference core (see `genmatterpp/VENDORED.md`) |
 
@@ -114,11 +147,11 @@ print(torch.__version__, torch.cuda.get_device_capability(), jax.devices())
 git clone --depth 1 https://github.com/princeton-vl/SEA-RAFT.git third_party/SEA-RAFT
 ```
 
-**Videos.** `assets/test.mp4` ships with the repo, so the Quickstart runs as-is. To
-use your own clip, transcode it to H.264 (`ffmpeg -i mine.mov -c:v libx264 -pix_fmt
-yuv420p -an assets/test.mp4`). To render the featured DAVIS figures, fetch the
-TAP-Vid DAVIS clips into `assets/tapvid_davis_30_videos_processed/` (driver:
-`genmatterpp/scripts/download_tapvid_davis.sh`). The Depth-Anything, SEA-RAFT,
+**Videos.** `assets/test.mp4` ships with the repo. Object-focused inference also
+needs an initial mask; a fresh clone must provide one with `--seed-mask` (the
+local custom dataset is ignored). Keep new inputs and outputs under `runs/` and
+pass their paths. For DAVIS, extract the official train/validation 480p corpus to
+`runs/unified_quality/data/DAVIS`. The existing TAP-Vid DAVIS layout remains supported. Depth-Anything, SEA-RAFT,
 and DINOv2 checkpoints download from Hugging Face on first use (cached under
 `~/.cache/huggingface/`).
 
@@ -127,8 +160,3 @@ and DINOv2 checkpoints download from Hugging Face on first use (cached under
 `render_demo.py`'s `FrameSource` already accepts an integer camera index
 (`isinstance(src, int)`, `0` = first USB camera) in addition to a file path, so
 pointing the live demo at a webcam is a one-value change — no other code changes.
-
----
-
-*Status: this is the real-time perception + tracking substrate; a fuller JAX
-inference model slots into the reserved worker in a later milestone.*

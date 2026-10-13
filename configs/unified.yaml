@@ -1,0 +1,46 @@
+# Presets for causal unified inference. `quality` is the default figure preset.
+common:
+  dino_checkpoint: facebook/dinov2-small
+  dino_h: 728
+  dino_w: 1288
+  particles: 256
+  foreground_fraction: 0.65
+  sweeps: 2
+  feature_variance: 0.8
+  feature_weight: 0.35
+  memory_weight: 18.0
+  persistence: 5.0
+  appearance_update: 0.08
+  huber_delta: 3.0
+  mean_prior_count: 1.5
+  covariance_prior_count: 4.0
+  particle_weight_prior: 3.0
+  covariance_growth_limit: 9.0
+  boundary_depth_radius: 3
+  seed: 42
+  warmup_frames: 3
+  sampling_stride: 4
+presets:
+  quality: {}
+  fast:
+    particles: 128
+    sweeps: 1
+custom_foreground_ids:
+  test:
+  - 11
+  purple_jacket:
+  - 11
+  gray_jacket:
+  - 1
+  jello_trim:
+  - 2
+  new_eagle_trim:
+  - 3
+  snake_trim:
+  - 3
+  two_blocks_centered:
+  - 3
+  - 4
+  - 5
+  wine_swirl:
+  - 1

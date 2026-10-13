@@ -33,3 +33,8 @@ assets/videos_tmp/
 genmatterpp/external/**/.git/
 genmatterpp/external/**/checkpoints/
 assets/tapvid_davis_30_videos_processed/
+# Local lab notes. Kept on disk, never published.
+docs/UNIFIED_QUALITY.md
+docs/UNIFIED_VALIDATION.md
+docs/unified_validation_results.json
+docs/unified_visual_reviews.json

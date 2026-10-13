@@ -1,7 +1,8 @@
-# Particle visualization demo (`render_gaussian_demo.py`)
+# Legacy particle visualization (`render_gaussian_demo.py`)
 
 > For the project overview + architecture, see the [README](../README.md). This doc is
 > the deep dive on the particle figure: layout, CLI flags, and the render-only knobs.
+> Focused mode is the unified figure in `scripts/render_unified.py`.
 
 A 2×3 video visualization of the GenMatter tracker's latent state: the input frame, the
 per-pixel particle/cluster segmentation, and the tracker's **actual 3-D Gaussian
@@ -20,13 +21,12 @@ overlay is render-only and the tracker stays bit-identical to the validated run.
 ## Quickstart
 
 ```bash
-# render the featured deforming subjects (dog, breakdance, horsejump-high, blackswan — DAVIS/GT)
-# as the unified pipeline figure (<vid>_unified.mp4, white-paper theme)
-RENDER_MODE=focused DEMO_NUM_BLOBS=256 STICKINESS=12 ROBUST_DELTA=6 \
-  scripts/render_particles_demo.sh --target-duration 0 --out-fps 12
+# Current unified figures, with initial DAVIS masks:
+python scripts/render_unified.py --videos dog breakdance horsejump-high blackswan \
+  --preset quality --out-dir runs/figures
 
-# any RAW video (no dataset / GT / SAM needed — k-means seed) — works on the bundled sample
-RENDER_MODE=focused scripts/render_particles_demo.sh --source assets/test.mp4 --target-duration 0
+# Legacy 2x3 on a raw video, using a k-means seed:
+scripts/render_particles_demo.sh --source assets/test.mp4 --target-duration 0
 
 # a single video, quick 24-frame smoke (no looping)
 python scripts/render_gaussian_demo.py --videos dog --max-frames 24 --target-duration 0
@@ -67,135 +67,22 @@ tint**. The camera pans slowly and monotonically (a shallow yaw sweep, no double
 
 ---
 
-## Focused mode (`RENDER_MODE=focused`) — ONE unified pipeline figure per clip
+## Focused mode (`RENDER_MODE=focused`)
 
-`RENDER_MODE=focused` writes **`<vid>_unified.mp4`** from one tracker pass (the 2×3 path
-above is used when `RENDER_MODE` is unset): a **white-paper conceptual figure**
-
-**`1. RGB input → 2. 3-D Gaussian particles → 3a. RGB reconstruction + 3b. object segmentation`**
-
-with floating panel cards (soft shadows), real typography (DejaVu via PIL), and pipeline arrows.
+Focused mode uses `scripts/render_unified.py`: one causal inference pass,
+saved state captures, then a CPU-only 5120×2080 figure render. Its configuration
+is `configs/unified.yaml`; legacy environment knobs below apply only to the 2×3
+renderer. It requires an initial object mask.
 
 ```bash
-RENDER_MODE=focused DEMO_NUM_BLOBS=256 STICKINESS=12 ROBUST_DELTA=6 \
-  python scripts/render_gaussian_demo.py \
-  --target-duration 0 --out-fps 12 --out-dir runs/calibrate_consistency/viz_unified
+python scripts/render_unified.py --videos test --preset quality --out-dir runs/figures
+python scripts/render_unified.py --videos test --preset quality --stage render --out-dir runs/figures
+python scripts/render_unified.py --videos test --preset fast --stage benchmark --out-dir runs/benchmark
 ```
 
-### The hero: ONE cloud, both attributes multiplexed per particle — pure particles
-Each particle has two attributes — **appearance** (average color) and **object membership**
-(semantic cluster) — and the hero shows ONE set of particles carrying both at once. There
-are **no point-cloud splats anywhere** in the figure:
-
-- **fill = average RGB** — the particle's true appearance (lit-sphere shaded marble, hi-res
-  160-px sprite for crisp shading; `MARBLE_SIGMA` 1.15 so a dense 256-blob cluster separates).
-  Colors come from a **slow per-blob EMA** (`LUT_EMA` 0.15, only blobs owning datapoints
-  update): on a hard pan a blob re-binds to new scene content, so a frame-0-locked color LUT
-  would keep painting its old color; the EMA tracks what each blob currently covers while
-  keeping identity stable. BOTH per-blob tables must be sized by
-  `num_blobs`: `compute_blob_color_lut(..., num_blobs=nb)` AND
-  `render_matter_label_grids(..., num_blobs=nb)` — the label grid's default palette-sized
-  clamp silently relabels every blob ≥ 128 as blob 127 at 256 blobs, painting half the
-  datapoints with one blob's color (see the **`num_blobs` rule** below);
-- **glow = an under-pass halo in its segmentation color** (`GLOW_ALPHA` 0.9,
-  `GLOW_SCALE` 2.4): all halos composite far→near *before* any fill, so they union into a soft
-  highlighter field behind a dense cluster instead of being covered by the fills. Background
-  glows are doubly faint (muted palette × `BG_FADE`), and the OBJECT's glow is **exempt from
-  the fog fade** (the subject marker stays full-strength at any depth);
-- **depth fog** (`FOG` 0.45, atmospheric perspective): fills mix toward the paper tone and
-  glows fade with each view's normalized (10th–90th pct) depth — near particles full-strength,
-  far ones recede into the page, so the cloud reads as a 3-D scene from particles alone;
-- **world stabilization** (`EGO_STABILIZE` 1): the background of the world tends to be static
-  and the **camera moves** — implemented computationally from the clustering. Each frame the
-  camera's ego-motion is solved by **trimmed weighted Kabsch** over the background blob means
-  (blob indices persist → correspondences are free; anchors = the blobs' previous world
-  positions, the worst-residual 25 % trimmed so a re-bound blob can't vote) and everything
-  renders in the **frame-0 world frame**: the background cloud holds still, the object moves
-  through it, and the camera rig visibly travels/pans with the real camera. The hero itself is
-  a fixed world-frame meta-camera (`_make_proj`) pivoting on the object's slow world EMA;
-- **three camera frustums at REAL positions, depth-interleaved with the marbles**: the
-  **original/input camera** (azure accent — the same border color as every panel imaged at
-  that pose) sits **exactly at the real camera position** (the camera-frame origin mapped
-  through the ego pose — it traces the true camera path), its plane is the real image plane,
-  and the two **novel** poses (gray, ±`FRUSTUM_YAW` 22°) are that camera orbited about the
-  object pivot on the **true-radius arc**. Rig scalars are **frozen in the moving camera
-  frame** at calibration end and mapped through the ego pose each frame, so the three cameras
-  stay **mutually rigid** (deriving them from per-frame object stats lets them drift apart).
-  Every camera is AIMED AT THE SCENE CENTER (`_frustum_cams` lookAt: the yaw-0 apex is the
-  real camera position, the novel apexes orbit it about the followed `aim_t`, and each image
-  plane is ⊥ its own view axis). Windows are TRUE perspective-warped planes (the novel views
-  shear), with the apex rays drawn UNDER the picture; the plane half-width is capped against
-  the aimed arc's plane-center spacing so adjacent planes can never fuse. Windows and marbles
-  composite in ONE painter's far→near ordering (marbles bucketed around each window's view
-  depth with a small HYSTERESIS deadband so matter at window depth can't flicker over/under,
-  passes chained through `base_tile`; labels drawn last): matter in front of a camera correctly
-  occludes it, matter behind it is hidden — no punch-through in either direction. Each
-  window shows **the rendered RGB representation as pixels**: the input plane carries the
-  per-pixel RGB reconstruction (= panel 3a, the azure tie), the novel planes carry the Gaussian
-  state **volumetrically splatted** to a dense soft image (`_render_gaussian_rgb_view`:
-  EWA-style footprints, front-to-back compositing, normalized by occlusion weight so paper
-  white doesn't bleed through between Gaussians; `GS_ALPHA_MAX` 0.9);
-- **FOLLOW hero camera — two-pass whole-clip solve**: the hero keeps the scene tightly framed
-  while NEVER zooming or dollying. PASS 0 runs the tracker over the source
-  once, collecting per-frame framing stats and freezing the rig scalars;
-  `_solve_follow_camera` then fits: the SMOOTHED EGO-POSE track (σ 5, rotations re-projected
-  to SO(3)) — the raw live Kabsch pose stream's noise rocks the whole view, visually identical
-  to viewer-camera jitter, so pass 1 renders the smoothed poses and never the raw solve; TWO
-  near-static tracks with FIXED depths (σ 25) — `aim_t` (the object/scene track every camera
-  points at and the novel apexes orbit) and `pivot_t` (the hero framing center, 0.7·object +
-  0.3·apex-mean); ONE focal (min over all frames of the soft-object / hard-rig fit at that
-  frame's pivot); the pullback (`PULLBACK` 0.6 — a pure view-depth retreat so the real camera
-  apexes frame); and the per-pose splat focals. PASS 1 replays the deterministic tracker and
-  renders with that camera: essentially still, drifting only when the action genuinely
-  migrates, constant scale, **everything fitting every frame by construction**. The aim and
-  framing tracks are deliberately SEPARATE — blending the apexes into the aim pulls the orbit
-  center toward the cameras, halving the arc radius (foreshortened poses) and fusing the planes;
-- **the inference-stats row** spans the bottom of the whole diagram (`_stats_row`): big
-  **inference FPS**, real-time, per-stage latency (depth / flow / dino), and tracker columns.
-
-The **object segmentation** output panel is the INFERRED flat cluster tile (vivid fg / muted
-bg + dark-red outliers), same palette as the glow (`_cluster_palette_for`): the green-glowing
-dog particles ARE the green segment.
-
-### Hero camera + frustum geometry
-- **`HERO_YAW` (12°) / `HERO_PITCH` (14°)** — gentle look-down; steeper (22–30°) turns the scene
-  into a floating specimen jar.
-- **`FRUSTUM_IMG_FRAC` (0.45)** — plane size: half-width from the object radius, floored at
-  0.06·d₀ and **capped by the camera spacing** (0.14·d₀, d₀ = the true camera-object distance)
-  so a large object can't fuse the three planes into a screen; the image
-  plane sits at 0.30·d₀ from the apex (a long camera-like pyramid).
-- **`RECON_FIT_MARGIN` (0.5)** — the video-independent fit (`_calibrate_marble_focal`): soft
-  97th-pct fit for object particles, **hard** 0.88 fit for frustum corners/apexes, solved
-  ONCE over the whole clip by the two-pass `_solve_fixed_camera` (min over all pass-0 frames),
-  so the camera is constant and everything fits every frame (no live calibration or
-  zoom guard). The novel-plane focals are object-fit (margin 0.75, scene-wide fits
-  collapse on near-camera background blobs), **median**-accumulated during pass 0, then frozen.
-
-All render-only (tracker state never touched → bit-identical tracking).
-
-### Figure-ground + featured subjects
-Background fills mix toward near-white (`BG_DESAT` 0.45) and fade (`BG_FADE` 0.3) — clearly
-transparent ghosts that keep the scene structure readable while the full-color, green-glowing
-object is unmistakably the subject. A cluster counts as "background" if it's seed/GT background
-(`hyperblob >= num_fg`) **or** — SAM seeds only — it covers more than `BG_SIZE_FRAC` (0.33) of
-the particles (a SAM seed mislabels the dominant couch/sky/ground as foreground; a GT seed is
-clean, and the size test would wrongly fade a large GT object like the breakdancer).
-
-The featured subjects (`DEFAULT_VIDEOS`) are deforming, low-occlusion DAVIS clips
-whose track holds across the whole clip (GT-seeded for the demo): **dog**, **breakdance**,
-**horsejump-high**, **blackswan**. Small subjects read poorly (too few particles land on them).
-To add your own: a single clearly-deforming object with low occlusion reads best; validate the
-track by rendering and checking the segmentation overlay follows the object cleanly across the
-clip before featuring it.
-
-### Seeds in focused mode (custom = SAM, DAVIS = GT)
-The demo seeds **custom** clips from their self-supervised SAM frame-0 map and **DAVIS** clips from
-their clean **GT** segmask. This is a *visualization* choice: a DAVIS GT mask is a single clean
-object, whereas the SAM-propagated DAVIS seed **over-segments** (e.g. blackswan → ~12 instances)
-and clutters the cluster lens. It is **not** an eval shortcut — the honest self-supervised path is
-SAM everywhere (`FORCE_SAM_SEED=1`). Custom clips have no GT and are always SAM-seeded either way.
-
----
+MP4s are saved as `<out-dir>/<clip>_unified.mp4`. `--stage render` redraws a
+saved capture, and `--stage benchmark` times inference without writing video.
+The sections below document the legacy non-focused renderer.
 
 ## Rendering any video / adding a new one
 
@@ -238,7 +125,7 @@ uint16 PNG with the id convention above is enough to render.)
 | `--source` | (none) | render a RAW video file (mp4/mov) or RGB-frames dir directly, k-means-seeded (no GT/SAM data) — overrides `--videos` |
 | `--config` | `configs/streaming_render_v2.yaml` | tracking YAML (the validated config) |
 | `--out-dir` | `runs/calibrate_consistency/viz_gaussian` | where `<video>_live.mp4` is written |
-| `--num-sweeps` | from config (1) | Gibbs sweeps per frame |
+| `--num-sweeps` | from config, otherwise 4 | Gibbs sweeps per frame (shipped config omits this key) |
 | `--max-frames` | -1 (whole clip) | cap source frames (small = quick smoke) |
 | `--out-fps` | 30 | output frame rate |
 | `--frame-stride` | 1 | keep every Nth source frame before looping |
@@ -248,26 +135,8 @@ uint16 PNG with the id convention above is enough to render.)
 
 | Env var | Default | Effect |
 |---------|---------|--------|
-| `RENDER_MODE` | (unset) | `focused` = the unified pipeline figure (see below); unset = the 2×3 grid |
+| `RENDER_MODE` | (unset) | `focused` = the unified pipeline figure (see above); unset = the 2×3 grid |
 | `FORCE_SAM_SEED` | 0 | `1` = seed EVERY clip with self-supervised SAM (no GT). Default off = custom→SAM, DAVIS→GT |
-| `HERO_YAW` | 12 | focused: hero meta-camera yaw (deg) |
-| `HERO_PITCH` | 14 | focused: hero elevation — gentle look-down (steeper = floating specimen jar) |
-| `HERO_DEPTH_SCALE` | 1.0 | focused: depth smoosh in the hero (1 = off; <1 compresses depth thickness) |
-| `FRUSTUM_YAW` | 22 | focused: ± yaw of the two novel frustum cameras (their images re-render from these poses; too wide and the fit shrinks the view windows) |
-| `PULLBACK` | 0.6 | focused: hero retreat (fraction of the true camera-object distance) so the REAL camera positions fit in frame |
-| `FRUSTUM_IMG_FRAC` | 0.4 | focused: frustum image-plane half-width (fraction of the object radius; spacing-capped) |
-| `RECON_FIT_MARGIN` | 0.5 | focused: soft object fit (97th pct) in the hero; frustums get a hard 0.88 fit, then frozen |
-| `FOCAL_CALIB_FRAMES` | 8 | focused: frames to min-accumulate the hero focal over before freezing |
-| `DEMO_NUM_BLOBS` | (config) | focused: override num_blobs (256 gives dense object coverage in the demo) |
-| `EGO_STABILIZE` | 1 | focused: world stabilization — Kabsch ego-motion from the background blobs (0 = camera frame) |
-| `LUT_EMA` | 0.15 | focused: per-blob avg-RGB color EMA rate (colors track a pan; the 2×3 grid keeps the frame-0 lock) |
-| `GS_ALPHA_MAX` | 0.9 | focused: peak per-Gaussian opacity in the novel planes' volumetric splat renders |
-| `GLOW_ALPHA` | 0.9 | focused: the semantic glow strength (object glow exempt from fog; 0 = off) |
-| `GLOW_SCALE` | 2.4 | focused: glow radius in units of the marble axes |
-| `FOG` | 0.45 | focused: depth fog — fills toward paper, glows fade with view depth (0 = off) |
-| `BG_FADE` | 0.3 | focused: background-particle alpha (1.0 = no fade) |
-| `BG_DESAT` | 0.45 | focused: mix background fills toward near-white (figure-ground on paper; 0 = off) |
-| `BG_SIZE_FRAC` | 0.33 | focused, SAM seeds only: a cluster covering > this fraction of particles is faded as background |
 | `PC_PAN_AMP` | 7.0 | (2×3 grid) camera pan half-range in degrees |
 | `PC_CENTROID_ALPHA` | 0.15 | orbit-center EMA (lower = steadier cloud) |
 | `MARBLE_GEOM_BETA` | 0.25 | per-particle mean/cov EMA (lower = steadier particles) |

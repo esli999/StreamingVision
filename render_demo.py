@@ -58,8 +58,8 @@ Causal-honesty contract
 """
 
 import os
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.25"
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.25")
 # Pin BLAS/OpenMP/MKL thread pools to ONE thread BEFORE importing numpy /
 # sklearn / torch.  The streaming pipeline runs 5 Python threads concurrently
 # (FrameSource, DepthWorker, FlowWorker, FeatureWorker, MatterWorker); when
@@ -184,11 +184,9 @@ def _load_depth_model(device: str = DEVICE):
 
 def _load_flow_model(device: str = DEVICE):
     """Load SEA-RAFT (Tartan-C-T-TSKH-spring540x960-M). Returns the model only."""
-    with open(SEA_CFG) as f:
-        cfg = json.load(f)
-    sea_args = argparse.Namespace(**cfg); sea_args.iters = 4; sea_args.scale = 0
-    return RAFT.from_pretrained("MemorySlices/Tartan-C-T-TSKH-spring540x960-M",
-                                args=sea_args).to(device).eval()
+    from unified.models import load_flow_model
+    model,_ = load_flow_model(device)
+    return model
 
 
 # Perf note: torch.compile + cudnn.benchmark are intentionally NOT used here. The

@@ -9,9 +9,8 @@
 #
 # Usage:
 #   RENDER_MODE=focused scripts/render_particles_demo.sh --source assets/test.mp4 --target-duration 0
-#                                                          # the bundled video (no dataset needed)
-#   RENDER_MODE=focused DEMO_NUM_BLOBS=256 STICKINESS=12 ROBUST_DELTA=6 \
-#     scripts/render_particles_demo.sh --target-duration 0 --out-fps 12   # featured subjects
+#                                                          # requires the local initial mask or --seed-mask
+#   RENDER_MODE=focused scripts/render_particles_demo.sh --videos dog blackswan --preset quality
 #   scripts/render_particles_demo.sh --videos blackswan    # one video (legacy 2x3)
 #   scripts/render_particles_demo.sh --videos wine_swirl two_blocks_centered --out-dir runs/mine
 #   RENDER_MODE=focused scripts/render_particles_demo.sh --videos all-davis   # all 30 DAVIS clips
@@ -19,8 +18,8 @@
 #   RENDER_MODE=focused scripts/render_particles_demo.sh --videos all         # every test video
 #   MEM_FRACTION=0.8 scripts/render_particles_demo.sh      # override the JAX mem fraction
 #
-# See docs/RENDER_PARTICLES.md for the full layout, env-knob tuning, and how to add a
-# new video. `python scripts/render_gaussian_demo.py --help` lists all flags + knobs.
+# docs/RENDER_PARTICLES.md describes the legacy 2x3 renderer.
+# Focused figures need an initial mask (DAVIS annotations, or --seed-mask).
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
