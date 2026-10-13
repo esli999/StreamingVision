@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.render_simplified_showcase import read_metadata, source_video
@@ -22,7 +22,7 @@ from unified.novel import layered_readouts, shaded_surface
 from unified.presentation import camera_coordinates
 from unified.projection import project_readouts
 from unified.render import (
-    CONTENT_BOXES, DEFAULT_COLOR, FONT_ROOT, INK, WHITE, arrow, paste_fit,
+    CONTENT_BOXES, DEFAULT_COLOR, INK, WHITE, arrow, frustum_points, paste_fit,
     scaled_camera, scene_cameras, text,
 )
 from unified.surface import particle_surfaces, raster_surfaces
@@ -81,6 +81,48 @@ class SavedDisplay:
         return frame
 
 
+def percept_connector(draw, frame):
+    """A continuous rounded branch from the camera's image plane to its readouts.
+
+    Anchor to the actual lower frustum edge, so the connection follows the saved
+    camera track. Text occupies dedicated space above the branch and below its
+    three terminals; no line runs through a caption or panel label.
+    """
+    uv, depth = frame['scene_camera'].project(
+        frustum_points(frame['source_camera'], frame['novel_target'], 2))
+    if np.any(depth <= .05):
+        raise ValueError('The source frustum must be visible to connect its readouts')
+    start = uv[[7, 8]].mean(axis=0) + np.array(BOXES['scene'][:2])
+    bus_y, terminal_y, corner = 1344., 1412., 36.
+    centers = [(BOXES[key][0] + BOXES[key][2]) / 2
+               for key in ('segmentation', 'surface', 'ground')]
+    junction = np.array([2820., bus_y])
+    t = np.linspace(0., 1., 65)[:, None]
+    control1 = np.array([start[0], bus_y - 80])
+    control2 = np.array([junction[0], bus_y - 80])
+    stem = ((1-t)**3*start + 3*(1-t)**2*t*control1
+            + 3*(1-t)*t*t*control2 + t**3*junction)
+    left, middle, right = centers
+    angles = np.linspace(np.pi, 1.5*np.pi, 17)
+    left_bend = np.column_stack([left+corner+corner*np.cos(angles),
+                                 bus_y+corner+corner*np.sin(angles)])
+    angles = np.linspace(1.5*np.pi, 2*np.pi, 17)
+    right_bend = np.column_stack([right-corner+corner*np.cos(angles),
+                                  bus_y+corner+corner*np.sin(angles)])
+    branch = [(left, terminal_y), *map(tuple, left_bend),
+              *map(tuple, right_bend), (right, terminal_y)]
+    paths = [list(map(tuple, stem)), branch, [(middle, bus_y), (middle, terminal_y)]]
+    # A narrow white keyline keeps the source connection readable over context
+    # particles. The blue itself matches the frustum and the three panel borders.
+    for color, width in ((WHITE, 22), (DEFAULT_COLOR, 12)):
+        for points in paths:
+            draw.line(points, fill=color, width=width, joint='curve')
+    for x in centers:
+        draw.ellipse((x-11, terminal_y-11, x+11, terminal_y+11), fill=DEFAULT_COLOR)
+    x, y = start
+    draw.ellipse((x-12, y-12, x+12, y+12), fill=WHITE, outline=DEFAULT_COLOR, width=6)
+
+
 def compose(display, index, *, verify_scene=False):
     frame = display.frame(index)
     image = Image.new('RGB', CANVAS_SIZE, WHITE)
@@ -105,7 +147,7 @@ def compose(display, index, *, verify_scene=False):
         with Image.open(still) as source:
             np.testing.assert_array_equal(original, np.asarray(source.crop(CONTENT_BOXES['scene'])))
     place(scene_cameras(cloud, frame['scene_camera'], [], frame['novel_target'],
-                        default_camera=frame['source_camera']), 'scene')
+                        default_camera=frame['source_camera'], show_labels=False), 'scene')
 
     # Query the same particle-conditioned percepts at slide-native resolution.
     readouts = layered_readouts(frame)
@@ -125,12 +167,9 @@ def compose(display, index, *, verify_scene=False):
     speed = f'{fps:.1f} FPS' if np.isfinite(fps) else '— FPS'
     text(draw, (1300, 528), speed, 56, INK, True)
     arrow(draw, (1272, 676), (1570, 676), (91, 111, 128), 44)
-    arrow(draw, (2820, 1182), (2820, 1270), (91, 111, 128), 36)
-
-    heading = 'Inferred mid-level visual representations from initial camera view'
-    font = ImageFont.truetype(str(FONT_ROOT / 'DejaVuSans-Bold.ttf'), 76)
-    x = (CANVAS_SIZE[0] - draw.textlength(heading, font=font)) / 2
-    text(draw, (x, 1288), heading, 76, DEFAULT_COLOR, True)
+    percept_connector(draw, frame)
+    text(draw, (96, 1112), 'Inferred mid-level', 80, DEFAULT_COLOR, True)
+    text(draw, (96, 1208), 'visual representations', 80, DEFAULT_COLOR, True)
     for key, label in (
         ('segmentation', '2D segmentation'),
         ('surface', 'Deformable object · 2.5D surface'),
@@ -190,7 +229,8 @@ def render(name, out_dir, preview_only=False):
         renderer_script_sha256=fingerprint(Path(__file__)), panel_boxes=BOXES,
         displayed_inference_timing=display.report['displayed_inference_timing'],
         geometry='Approved stabilized particle states, held appearance and camera tracks replayed without refitting.',
-        frustum='Initial camera only; same pose, field of view and glyph as the detailed figure.',
+        frustum='One unlabeled source-camera frustum; same pose and field of view as the detailed figure.',
+        linkage='Blue rounded branch anchored to the lower edge of the actual frustum image plane; three terminals above readout labels and matching panel borders.',
         readouts='Particle-conditioned 2D segmentation, deformable-object 2.5D surface and background 2.5D surface; initial-camera support.',
         surface_view='Approved fixed oblique display cameras reveal surface depth; no novel-view synthesis panels.',
     ))
@@ -221,7 +261,7 @@ document.querySelectorAll('video').forEach(other=>{if(other!==video)other.pause(
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--clips', nargs='+', choices=CLIPS, default=list(CLIPS))
-    parser.add_argument('--out-dir', type=Path, default=ROOT / 'runs/unified_quality/midlevel_slide_layout')
+    parser.add_argument('--out-dir', type=Path, default=ROOT / 'runs/unified_quality/midlevel_slide_layout_v2')
     parser.add_argument('--preview-only', action='store_true')
     args = parser.parse_args()
     allowed = set()

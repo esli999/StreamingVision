@@ -205,7 +205,7 @@ def frustum_points(camera, target, index=0, length_scale=.64):
     return np.asarray(points)
 
 
-def scene_cameras(cloud, viewer, cameras, target, scale=1.,default_camera=None):
+def scene_cameras(cloud, viewer, cameras, target, scale=1.,default_camera=None, *, show_labels=True):
     """Actual synthesis extrinsics/FOV, in the particle scene's coordinate frame."""
     image=Image.fromarray(cloud).convert('RGBA')
     overlay=Image.new('RGBA',image.size);draw=ImageDraw.Draw(overlay)
@@ -232,7 +232,7 @@ def scene_cameras(cloud, viewer, cameras, target, scale=1.,default_camera=None):
         for j in range(1,5):
             draw.line([points[0],points[j+4]],fill=(*color,255),width=width)
     # Put every camera name above all wires, including intersecting frustums.
-    for _,k,uv in entries:
+    for _,k,uv in (entries if show_labels else ()):
         color=DEFAULT_COLOR if k==2 else VIEW_COLORS[k]
         px,py=uv[0];dx,dy=FRUSTUM_BADGE_OFFSETS[k];lx,ly=px+dx*scale,py+dy*scale
         draw.line([(px,py),(lx,ly)],fill=(*color,255),width=max(1,round(5*scale)))
