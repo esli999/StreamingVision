@@ -43,6 +43,15 @@ without loading inference models; `--stage benchmark` measures inference alone.
 Presets live in `configs/unified.yaml`. See
 [legacy particle rendering](docs/RENDER_PARTICLES.md) for the older 2×3 layout.
 
+For the separate, simplified slide layout, run
+`python scripts/render_simplified_showcase.py` after the detailed showcase exports
+exist in `runs/unified_quality/animal_percepts` and `percept_debug`. This keeps the
+input, inference FPS and particle scene, with the three RGB views arranged
+left-to-right as **Pose 2 → Initial → Pose 1**, matching the frustums. New movies,
+still figures and a gallery are saved to `runs/unified_quality/screenshot_slide_layout`.
+Use `--preview-only` for stills or a fresh `--out-dir` for another export; existing
+movies and galleries are never replaced.
+
 ## Validate the demos without replacing assets
 
 Run these commands from the repository root in the `streamingvision` environment.
