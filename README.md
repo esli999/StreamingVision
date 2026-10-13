@@ -52,6 +52,15 @@ still figures and a gallery are saved to `runs/unified_quality/screenshot_slide_
 Use `--preview-only` for stills or a fresh `--out-dir` for another export; existing
 movies and galleries are never replaced.
 
+For a matching set focused on mid-level vision, run
+`python scripts/render_midlevel_showcase.py`. It renders blackswan, bear, elephant
+and dog at 4096×2304 (16:9), with the initial frustum above three large panels:
+segmentation, deformable-object surface and background surface. It reuses the
+saved particle states and cameras from `animal_percepts`, without inference or
+novel-view panels. Movies, stills and the player go to the separate
+`runs/unified_quality/midlevel_slide_layout` folder. `--preview-only` and a fresh
+`--out-dir` are supported; earlier exports are preserved.
+
 ## Validate the demos without replacing assets
 
 Run these commands from the repository root in the `streamingvision` environment.
