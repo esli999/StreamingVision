@@ -54,12 +54,13 @@ movies and galleries are never replaced.
 
 For a matching set focused on mid-level vision, run
 `python scripts/render_midlevel_showcase.py`. It renders blackswan, bear, elephant
-and dog at 4096×2304 (16:9), with one unlabeled frustum above three large panels:
-segmentation, deformable-object surface and background surface. It reuses the
+and dog at 4096×2304 (16:9), with one camera frustum above three large panels:
+segmentation, object surface and background surface. It reuses the
 saved particle states and cameras from `animal_percepts`, without inference or
 novel-view panels. Movies, stills and the player go to the separate
-`runs/unified_quality/midlevel_slide_layout_v2` folder. A rounded blue branch links
-the frustum directly to the three readouts. `--preview-only` and a fresh
+`runs/unified_quality/midlevel_slide_layout_v3` folder. A broad filled arrow connects
+the camera to an aligned row of segmentation and 2.5D surface panels under a shared
+group heading. `--preview-only` and a fresh
 `--out-dir` are supported; earlier exports are preserved.
 
 ## Validate the demos without replacing assets

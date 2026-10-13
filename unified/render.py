@@ -205,7 +205,8 @@ def frustum_points(camera, target, index=0, length_scale=.64):
     return np.asarray(points)
 
 
-def scene_cameras(cloud, viewer, cameras, target, scale=1.,default_camera=None, *, show_labels=True):
+def scene_cameras(cloud, viewer, cameras, target, scale=1.,default_camera=None, *, show_labels=True,
+                  default_label='Initial'):
     """Actual synthesis extrinsics/FOV, in the particle scene's coordinate frame."""
     image=Image.fromarray(cloud).convert('RGBA')
     overlay=Image.new('RGBA',image.size);draw=ImageDraw.Draw(overlay)
@@ -236,7 +237,7 @@ def scene_cameras(cloud, viewer, cameras, target, scale=1.,default_camera=None, 
         color=DEFAULT_COLOR if k==2 else VIEW_COLORS[k]
         px,py=uv[0];dx,dy=FRUSTUM_BADGE_OFFSETS[k];lx,ly=px+dx*scale,py+dy*scale
         draw.line([(px,py),(lx,ly)],fill=(*color,255),width=max(1,round(5*scale)))
-        label=['Pose 1','Pose 2','Initial'][k]
+        label=['Pose 1','Pose 2',default_label][k]
         font=ImageFont.truetype(str(FONT_ROOT/'DejaVuSans-Bold.ttf'),max(12,round(58*scale)))
         half=draw.textlength(label,font=font)/2+18*scale
         draw.rounded_rectangle((lx-half,ly-43*scale,lx+half,ly+43*scale),

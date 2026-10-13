@@ -22,7 +22,7 @@ from unified.novel import layered_readouts, shaded_surface
 from unified.presentation import camera_coordinates
 from unified.projection import project_readouts
 from unified.render import (
-    CONTENT_BOXES, DEFAULT_COLOR, INK, WHITE, arrow, frustum_points, paste_fit,
+    CONTENT_BOXES, DEFAULT_COLOR, FRUSTUM_BADGE_OFFSETS, INK, WHITE, arrow, frustum_points, paste_fit,
     scaled_camera, scene_cameras, text,
 )
 from unified.surface import particle_surfaces, raster_surfaces
@@ -82,45 +82,17 @@ class SavedDisplay:
 
 
 def percept_connector(draw, frame):
-    """A continuous rounded branch from the camera's image plane to its readouts.
-
-    Anchor to the actual lower frustum edge, so the connection follows the saved
-    camera track. Text occupies dedicated space above the branch and below its
-    three terminals; no line runs through a caption or panel label.
-    """
+    """Conventional camera-to-output arrow ending at the shared readout group."""
     uv, depth = frame['scene_camera'].project(
         frustum_points(frame['source_camera'], frame['novel_target'], 2))
     if np.any(depth <= .05):
         raise ValueError('The source frustum must be visible to connect its readouts')
-    start = uv[[7, 8]].mean(axis=0) + np.array(BOXES['scene'][:2])
-    bus_y, terminal_y, corner = 1344., 1412., 36.
-    centers = [(BOXES[key][0] + BOXES[key][2]) / 2
-               for key in ('segmentation', 'surface', 'ground')]
-    junction = np.array([2820., bus_y])
-    t = np.linspace(0., 1., 65)[:, None]
-    control1 = np.array([start[0], bus_y - 80])
-    control2 = np.array([junction[0], bus_y - 80])
-    stem = ((1-t)**3*start + 3*(1-t)**2*t*control1
-            + 3*(1-t)*t*t*control2 + t**3*junction)
-    left, middle, right = centers
-    angles = np.linspace(np.pi, 1.5*np.pi, 17)
-    left_bend = np.column_stack([left+corner+corner*np.cos(angles),
-                                 bus_y+corner+corner*np.sin(angles)])
-    angles = np.linspace(1.5*np.pi, 2*np.pi, 17)
-    right_bend = np.column_stack([right-corner+corner*np.cos(angles),
-                                  bus_y+corner+corner*np.sin(angles)])
-    branch = [(left, terminal_y), *map(tuple, left_bend),
-              *map(tuple, right_bend), (right, terminal_y)]
-    paths = [list(map(tuple, stem)), branch, [(middle, bus_y), (middle, terminal_y)]]
-    # A narrow white keyline keeps the source connection readable over context
-    # particles. The blue itself matches the frustum and the three panel borders.
-    for color, width in ((WHITE, 22), (DEFAULT_COLOR, 12)):
-        for points in paths:
-            draw.line(points, fill=color, width=width, joint='curve')
-    for x in centers:
-        draw.ellipse((x-11, terminal_y-11, x+11, terminal_y+11), fill=DEFAULT_COLOR)
-    x, y = start
-    draw.ellipse((x-12, y-12, x+12, y+12), fill=WHITE, outline=DEFAULT_COLOR, width=6)
+    label_center = uv[0] + np.array(FRUSTUM_BADGE_OFFSETS[2]) + np.array(BOXES['scene'][:2])
+    # The arrow starts below the Camera annotation and ends above the group rule.
+    # Its 84-pixel shaft remains legible when the 4K figure is shown on a slide.
+    start = (label_center[0], label_center[1] + 43 + 24)
+    arrow(draw, start, (label_center[0], 1360), DEFAULT_COLOR, 84)
+    draw.line([(64, 1384), (4032, 1384)], fill=DEFAULT_COLOR, width=10)
 
 
 def compose(display, index, *, verify_scene=False):
@@ -147,7 +119,7 @@ def compose(display, index, *, verify_scene=False):
         with Image.open(still) as source:
             np.testing.assert_array_equal(original, np.asarray(source.crop(CONTENT_BOXES['scene'])))
     place(scene_cameras(cloud, frame['scene_camera'], [], frame['novel_target'],
-                        default_camera=frame['source_camera'], show_labels=False), 'scene')
+                        default_camera=frame['source_camera'], default_label='Camera'), 'scene')
 
     # Query the same particle-conditioned percepts at slide-native resolution.
     readouts = layered_readouts(frame)
@@ -168,15 +140,14 @@ def compose(display, index, *, verify_scene=False):
     text(draw, (1300, 528), speed, 56, INK, True)
     arrow(draw, (1272, 676), (1570, 676), (91, 111, 128), 44)
     percept_connector(draw, frame)
-    text(draw, (96, 1112), 'Inferred mid-level', 80, DEFAULT_COLOR, True)
-    text(draw, (96, 1208), 'visual representations', 80, DEFAULT_COLOR, True)
+    text(draw, (64, 1254), 'Mid-level representations', 84, DEFAULT_COLOR, True)
     for key, label in (
-        ('segmentation', '2D segmentation'),
-        ('surface', 'Deformable object · 2.5D surface'),
-        ('ground', 'Background · 2.5D surface'),
+        ('segmentation', 'Segmentation'),
+        ('surface', 'Object surface (2.5D)'),
+        ('ground', 'Background surface (2.5D)'),
     ):
         x, y, right, bottom = BOXES[key]
-        text(draw, (x, 1440), label, 66, INK, True)
+        text(draw, (x, 1440), label, 72, INK, True)
         draw.rectangle((x - 3, y - 3, right + 3, bottom + 3), outline=DEFAULT_COLOR, width=5)
     return image
 
@@ -229,8 +200,8 @@ def render(name, out_dir, preview_only=False):
         renderer_script_sha256=fingerprint(Path(__file__)), panel_boxes=BOXES,
         displayed_inference_timing=display.report['displayed_inference_timing'],
         geometry='Approved stabilized particle states, held appearance and camera tracks replayed without refitting.',
-        frustum='One unlabeled source-camera frustum; same pose and field of view as the detailed figure.',
-        linkage='Blue rounded branch anchored to the lower edge of the actual frustum image plane; three terminals above readout labels and matching panel borders.',
+        frustum='One source-camera frustum labeled Camera; same pose and field of view as the detailed figure.',
+        linkage='Broad filled arrow from the Camera annotation to a shared group rule above three aligned readout panels.',
         readouts='Particle-conditioned 2D segmentation, deformable-object 2.5D surface and background 2.5D surface; initial-camera support.',
         surface_view='Approved fixed oblique display cameras reveal surface depth; no novel-view synthesis panels.',
     ))
@@ -261,7 +232,7 @@ document.querySelectorAll('video').forEach(other=>{if(other!==video)other.pause(
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--clips', nargs='+', choices=CLIPS, default=list(CLIPS))
-    parser.add_argument('--out-dir', type=Path, default=ROOT / 'runs/unified_quality/midlevel_slide_layout_v2')
+    parser.add_argument('--out-dir', type=Path, default=ROOT / 'runs/unified_quality/midlevel_slide_layout_v3')
     parser.add_argument('--preview-only', action='store_true')
     args = parser.parse_args()
     allowed = set()
