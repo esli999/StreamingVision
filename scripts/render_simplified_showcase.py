@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Recompose the approved movies into the separate screenshot-style slide layout.
+"""Recompose a finished detailed export into a slide of camera-view renderings.
 
-The existing particle animation, camera poses, RGB projections and measured FPS
-are retained. Only panel placement and the visible set of readouts change.
+Particle animation, camera poses, RGB projections and measured FPS are kept.
+Only panel placement and which readouts are shown change.
 """
 import argparse
 import html
@@ -161,7 +161,7 @@ def gallery(out_dir, names):
     for name in names:
         source = source_video(name)
         report, _ = read_metadata(source)
-        stem = f'{name}_simplified'
+        stem = f'{name}_renderings'
         title = 'Test video' if name == 'test' else name.title()
         cards.append(f'''<article><h2>{html.escape(title)}</h2>
 <video controls loop playsinline preload="metadata" poster="{stem}_00000.jpg"
@@ -185,7 +185,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--clips', nargs='+', choices=CLIPS, default=list(CLIPS))
     parser.add_argument('--out-dir', type=Path,
-                        default=ROOT / 'runs/unified_quality/screenshot_slide_layout')
+                        default=ROOT / 'runs/unified_quality/renderings')
     parser.add_argument('--preview-only', action='store_true')
     args = parser.parse_args()
     previews = set()
@@ -193,17 +193,17 @@ def main():
         source = source_video(name)
         if args.out_dir.resolve() == source.parent.resolve():
             parser.error('The simplified layout must use a separate output folder.')
-        if (args.out_dir / f'{name}_simplified.mp4').exists():
+        if (args.out_dir / f'{name}_renderings.mp4').exists():
             parser.error('Output movie already exists; choose a new --out-dir.')
         report, _ = read_metadata(source)
-        previews.update(f'{name}_simplified_{report["frames"]//2:05d}.{suffix}'
+        previews.update(f'{name}_renderings_{report["frames"]//2:05d}.{suffix}'
                         for suffix in ('png', 'jpg'))
     if args.out_dir.exists() and {p.name for p in args.out_dir.iterdir()} - previews:
         parser.error('Output folder contains an earlier export; choose a new --out-dir.')
     args.out_dir.mkdir(parents=True, exist_ok=True)
     for name in args.clips:
         source = source_video(name)
-        output = args.out_dir / f'{name}_simplified.mp4'
+        output = args.out_dir / f'{name}_renderings.mp4'
         if args.preview_only:
             report, rates = read_metadata(source)
             save_still(source, output, report, rates, report['frames'] // 2)

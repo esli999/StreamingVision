@@ -43,25 +43,23 @@ without loading inference models; `--stage benchmark` measures inference alone.
 Presets live in `configs/unified.yaml`. See
 [legacy particle rendering](docs/RENDER_PARTICLES.md) for the older 2×3 layout.
 
-For the separate, simplified slide layout, run
-`python scripts/render_simplified_showcase.py` after the detailed showcase exports
-exist in `runs/unified_quality/animal_percepts` and `percept_debug`. This keeps the
-input, inference FPS and particle scene, with the three RGB views arranged
-left-to-right as **Pose 2 → Initial → Pose 1**, matching the frustums. New movies,
-still figures and a gallery are saved to `runs/unified_quality/screenshot_slide_layout`.
-Use `--preview-only` for stills or a fresh `--out-dir` for another export; existing
-movies and galleries are never replaced.
+Camera-view slides reuse a finished detailed export from
+`runs/unified_quality/animal_percepts` (and `percept_debug` for the sample clip):
 
-For a matching set focused on mid-level vision, run
-`python scripts/render_midlevel_showcase.py`. It renders blackswan, bear, elephant
-and dog at 4096×2304 (16:9), with one camera frustum above three large panels:
-segmentation, object surface and background surface. It reuses the
-saved particle states and cameras from `animal_percepts`, without inference or
-novel-view panels. Movies, stills and the player go to the separate
-`runs/unified_quality/midlevel_slide_layout_v4` folder. The aligned panels share
-the heading “Inferred mid-level visual representations” and the frustum's blue
-color, without a camera-to-readout arrow. `--preview-only` and a fresh
-`--out-dir` are supported; earlier exports are preserved.
+```bash
+python scripts/render_simplified_showcase.py
+# -> runs/unified_quality/renderings/<clip>_renderings.mp4
+```
+
+Mid-level slides reuse those same particle states for blackswan, bear, elephant and dog:
+
+```bash
+python scripts/render_midlevel_showcase.py
+# -> runs/unified_quality/midlevel/<clip>_midlevel.mp4
+```
+
+Each command also writes stills and `index.html` in that folder. Pass `--out-dir`
+to choose another folder; an existing movie in the destination is left in place.
 
 ## Validate the demos without replacing assets
 

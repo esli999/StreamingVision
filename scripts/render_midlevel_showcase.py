@@ -218,7 +218,7 @@ document.querySelectorAll('video').forEach(other=>{if(other!==video)other.pause(
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--clips', nargs='+', choices=CLIPS, default=list(CLIPS))
-    parser.add_argument('--out-dir', type=Path, default=ROOT / 'runs/unified_quality/midlevel_slide_layout_v4')
+    parser.add_argument('--out-dir', type=Path, default=ROOT / 'runs/unified_quality/midlevel')
     parser.add_argument('--preview-only', action='store_true')
     args = parser.parse_args()
     allowed = set()
