@@ -58,9 +58,9 @@ and dog at 4096×2304 (16:9), with one camera frustum above three large panels:
 segmentation, object surface and background surface. It reuses the
 saved particle states and cameras from `animal_percepts`, without inference or
 novel-view panels. Movies, stills and the player go to the separate
-`runs/unified_quality/midlevel_slide_layout_v3` folder. A broad filled arrow connects
-the camera to an aligned row of segmentation and 2.5D surface panels under a shared
-group heading. `--preview-only` and a fresh
+`runs/unified_quality/midlevel_slide_layout_v4` folder. The aligned panels share
+the heading “Inferred mid-level visual representations” and the frustum's blue
+color, without a camera-to-readout arrow. `--preview-only` and a fresh
 `--out-dir` are supported; earlier exports are preserved.
 
 ## Validate the demos without replacing assets

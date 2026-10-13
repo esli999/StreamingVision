@@ -22,7 +22,7 @@ from unified.novel import layered_readouts, shaded_surface
 from unified.presentation import camera_coordinates
 from unified.projection import project_readouts
 from unified.render import (
-    CONTENT_BOXES, DEFAULT_COLOR, FRUSTUM_BADGE_OFFSETS, INK, WHITE, arrow, frustum_points, paste_fit,
+    CONTENT_BOXES, DEFAULT_COLOR, INK, WHITE, arrow, paste_fit,
     scaled_camera, scene_cameras, text,
 )
 from unified.surface import particle_surfaces, raster_surfaces
@@ -81,20 +81,6 @@ class SavedDisplay:
         return frame
 
 
-def percept_connector(draw, frame):
-    """Conventional camera-to-output arrow ending at the shared readout group."""
-    uv, depth = frame['scene_camera'].project(
-        frustum_points(frame['source_camera'], frame['novel_target'], 2))
-    if np.any(depth <= .05):
-        raise ValueError('The source frustum must be visible to connect its readouts')
-    label_center = uv[0] + np.array(FRUSTUM_BADGE_OFFSETS[2]) + np.array(BOXES['scene'][:2])
-    # The arrow starts below the Camera annotation and ends above the group rule.
-    # Its 84-pixel shaft remains legible when the 4K figure is shown on a slide.
-    start = (label_center[0], label_center[1] + 43 + 24)
-    arrow(draw, start, (label_center[0], 1360), DEFAULT_COLOR, 84)
-    draw.line([(64, 1384), (4032, 1384)], fill=DEFAULT_COLOR, width=10)
-
-
 def compose(display, index, *, verify_scene=False):
     frame = display.frame(index)
     image = Image.new('RGB', CANVAS_SIZE, WHITE)
@@ -139,8 +125,8 @@ def compose(display, index, *, verify_scene=False):
     speed = f'{fps:.1f} FPS' if np.isfinite(fps) else '— FPS'
     text(draw, (1300, 528), speed, 56, INK, True)
     arrow(draw, (1272, 676), (1570, 676), (91, 111, 128), 44)
-    percept_connector(draw, frame)
-    text(draw, (64, 1254), 'Mid-level representations', 84, DEFAULT_COLOR, True)
+    draw.line([(64, 1384), (4032, 1384)], fill=DEFAULT_COLOR, width=10)
+    text(draw, (64, 1254), 'Inferred mid-level visual representations', 84, DEFAULT_COLOR, True)
     for key, label in (
         ('segmentation', 'Segmentation'),
         ('surface', 'Object surface (2.5D)'),
@@ -201,7 +187,7 @@ def render(name, out_dir, preview_only=False):
         displayed_inference_timing=display.report['displayed_inference_timing'],
         geometry='Approved stabilized particle states, held appearance and camera tracks replayed without refitting.',
         frustum='One source-camera frustum labeled Camera; same pose and field of view as the detailed figure.',
-        linkage='Broad filled arrow from the Camera annotation to a shared group rule above three aligned readout panels.',
+        linkage='Shared blue group rule and panel borders match the camera frustum; no camera-to-readout arrow.',
         readouts='Particle-conditioned 2D segmentation, deformable-object 2.5D surface and background 2.5D surface; initial-camera support.',
         surface_view='Approved fixed oblique display cameras reveal surface depth; no novel-view synthesis panels.',
     ))
@@ -232,7 +218,7 @@ document.querySelectorAll('video').forEach(other=>{if(other!==video)other.pause(
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--clips', nargs='+', choices=CLIPS, default=list(CLIPS))
-    parser.add_argument('--out-dir', type=Path, default=ROOT / 'runs/unified_quality/midlevel_slide_layout_v3')
+    parser.add_argument('--out-dir', type=Path, default=ROOT / 'runs/unified_quality/midlevel_slide_layout_v4')
     parser.add_argument('--preview-only', action='store_true')
     args = parser.parse_args()
     allowed = set()
